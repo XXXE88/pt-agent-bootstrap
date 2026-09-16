@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# pt — PT Agent 启动器（宿主机侧）
+#   pt                进入当前交战容器（无则新建）
+#   pt init           配置模型与密钥 + 连通性自检
+#   pt doctor         六项自检
+#   pt update         更新镜像与身份包
+#   pt down           停止并删除交战容器（保留工作区）
+#   pt clean          删除工作区（二次确认）；--purge 连容器一起
+#   pt capture on|off mitmproxy 流量存档开关
+#   pt install <pkg>  在工作区工具箱安装工具（随工作区走）
+#   pt snapshot <tag> 把当前容器提交为派生镜像
+#   pt selftest       靶场冒烟 + 评分（M3）
+#   pt export-learnings  脱敏导出本地经验
+#   pt fix-perms      把工作区属主改回当前用户
+#   pt help
+
+set -euo pipefail
+
+PT_HOME="${PT_HOME:-$HOME/.pentest-agent}"
+CONFIG="$PT_HOME/config.env"
+[ -f "$CONFIG" ] || { echo "未找到 $CONFIG —— 先运行 installer/install.sh" >&2; exit 1; }
+set -a; . "$CONFIG"; set +a
+
+IMAGE="${PT_IMAGE:-ghcr.io/xxxe88/pt-agent:0.1.0}"
+WS_ROOT="$PT_HOME/workspaces"
+PI_HOME="$PT_HOME/pi-home"
+NETWORK="${PT_NETWORK:-host}"
+CAPS="${PT_CAPS:-NET_RAW,NET_ADMIN}"
+MEM="${PT_MEM:-4g}"
+CPUS="${PT_CPUS:-2}"
+PIDS="${PT_PIDS_LIMIT:-2048}"
+
+C_B="\033[36m"; C_G="\033[32m"; C_Y="\033[33m"; C_R="\033[31m"; C_0="\033[0m"
+log(){ printf "${C_B}[pt]${C_0} %s\n" "$*"; }
+ok(){ printf "${C_G}[ok]${C_0} %s\n" "$*"; }
+warn(){ printf "${C_Y}[!]${C_0} %s\n" "$*"; }
+die(){ printf "${C_R}[x]${C_0} %s\n" "$*" >&2; exit 1; }
+
+need_docker(){ command -v docker >/dev/null || die "缺少 docker"; docker info >/dev/null 2>&1 || die "docker daemon 不可用"; }
+slug(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//' | cut -c1-40; }
+
+pick_engagement(){
+  mkdir -p "$WS_ROOT"
+  if [ -n "${PT_ENG:-}" ]; then ENG="$PT_ENG"; else
+    mapfile -t dirs < <(cd "$WS_ROOT" 2>/dev/null && ls -1d */ 2>/dev/null | sed 's|/$||')
+    if [ "${#dirs[@]}" -eq 1 ]; then ENG="${dirs[0]}"
+    elif [ "${#dirs[@]}" -eq 0 ]; then
+      read -rp "交战名（如 acme-2026q4）: " name; [ -n "$name" ] || die "必须给交战起名"
+      ENG="$(slug "$name")"
+    else
+      echo "选择交战:"; select d in "${dirs[@]}"; do ENG="$d"; break; done
+    fi
+  fi
+  ENG="$(slug "$ENG")"; WS="$WS_ROOT/$ENG"; mkdir -p "$WS"/{01-资产,02-证据,03-笔记,04-报告,chains,secrets,audit}
+  chmod 700 "$WS/secrets"
+  [ -f "$WS/00-简报.md" ] || cat > "$WS/00-简报.md" <<EOF
+# $ENG
+
+- 授权方：
+- 时间窗：
+- 范围（域名/IP/URL）：
+- 排除项：
+- 联系人：
+- 备注：
+EOF
+  [ -f "$WS/findings.jsonl" ] || : > "$WS/findings.jsonl"
+}
+
+container_name(){ printf 'pt-%s' "$1"; }
+
+docker_args(){
+  local ws="$1"
+  printf '%s\n' \
+    --rm -it \
+    --name "$(container_name "$ENG")" \
+    --hostname "pt-$ENG" \
+    --workdir /work \
+    -v "$ws:/work" \
+    -v "$PI_HOME:/root/.pi/agent" \
+    --env-file "$CONFIG" \
+    -e "PT_ENG=$ENG" \
+    -e "TZ=${TZ:-Asia/Shanghai}" \
+    --memory "$MEM" --cpus "$CPUS" --pids-limit "$PIDS"
+  if [ "$NETWORK" = "host" ]; then
+    printf '%s\n' --network host --cap-add "$(printf '%s' "$CAPS" | tr ',' '\n' | sed 's/^/CAP_/' | paste -sd, -)"
+  else
+    printf '%s\n' --network pt-net --cap-add "$(printf '%s' "$CAPS" | tr ',' '\n' | sed 's/^/CAP_/' | paste -sd, -)"
+  fi
+  [ -n "${HTTP_PROXY:-}" ] && printf '%s\n' -e "HTTP_PROXY=$HTTP_PROXY" -e "HTTPS_PROXY=${HTTPS_PROXY:-$HTTP_PROXY}"
+  [ -n "${NO_PROXY:-}" ]   && printf '%s\n' -e "NO_PROXY=$NO_PROXY"
+}
+
+cmd_run(){
+  need_docker; pick_engagement
+  local cname; cname="$(container_name "$ENG")"
+  if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
+    log "接入已运行的交战容器 $cname"
+    shift || true
+    docker exec -it -w /work "$cname" pi "$@"
+  else
+    log "启动交战容器 $cname（$IMAGE）· 网络 $NETWORK · ${MEM}/${CPUS}cpu"
+    # shellcheck disable=SC2046
+    docker run $(docker_args "$WS") "$IMAGE" "$@"
+  fi
+}
+
+cmd_init(){
+  need_docker
+  log "模型配置向导"
+  echo "  1) DeepSeek 直连（默认）"
+  echo "  2) Anthropic / OpenAI / 其他原生 provider"
+  echo "  3) 自建 OpenAI 兼容网关"
+  read -rp "选择 [1-3，默认 1]: " c; c="${c:-1}"
+  case "$c" in
+    1) read -rsp "DEEPSEEK_API_KEY: " k; echo
+       sed -i '/^#\? *DEEPSEEK_API_KEY=/d' "$CONFIG"; echo "DEEPSEEK_API_KEY=$k" >> "$CONFIG";;
+    2) read -rp "provider 名（anthropic/openai/...）: " p; read -rsp "API KEY: " k; echo
+       sed -i '/^#\? *PT_PROVIDER=/d' "$CONFIG"; echo "PT_PROVIDER=$p" >> "$CONFIG"
+       echo "${p^^}_API_KEY=$k" >> "$CONFIG";;
+    3) read -rp "网关 baseURL（…/v1）: " u; read -rsp "网关 API KEY: " k; echo
+       sed -i '/^#\? *PT_PROVIDER=\|^#\? *PT_BASE_URL=\|^#\? *PT_API_KEY=/d' "$CONFIG"
+       { echo "PT_PROVIDER=gateway"; echo "PT_BASE_URL=$u"; echo "PT_API_KEY=$k"; } >> "$CONFIG";;
+  esac
+  read -rp "默认模型 [默认 ${PT_MODEL:-deepseek-v4-flash}]: " m
+  if [ -n "$m" ]; then sed -i "s|^PT_MODEL=.*|PT_MODEL=$m|" "$CONFIG"; fi
+  chmod 600 "$CONFIG"
+  ok "已写入 $CONFIG"
+  log "连通性自检（发一次最小请求）"
+  local extra=()
+  [ -n "${PT_BASE_URL:-}" ] && extra+=(--base-url "$PT_BASE_URL")
+  [ -n "${PT_API_KEY:-}" ] && extra+=(--api-key "$PT_API_KEY")
+  if docker run --rm --env-file "$CONFIG" "$IMAGE" \
+      pi -p ${extra[@]+"${extra[@]}"} --model "${PT_MODEL:-deepseek-v4-flash}" "只回复两个字符：OK" 2>&1 | tail -5; then
+    ok "模型连通"
+  else
+    warn "自检失败：检查 key / baseURL / 模型名（可重跑 pt init）"
+  fi
+}
+
+cmd_doctor(){
+  need_docker; local bad=0
+  chk(){ local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else warn "$n 失败"; bad=$((bad+1)); fi; }
+  chk "docker daemon" docker info
+  chk "镜像 $IMAGE" docker image inspect "$IMAGE"
+  chk "config.env 权限 600" bash -c "[ \"\$(stat -c %a '$CONFIG')\" = 600 ]"
+  chk "pi 运行时" docker run --rm --env-file "$CONFIG" "$IMAGE" pi --version
+  chk "身份包 AGENTS.md" docker run --rm --env-file "$CONFIG" "$IMAGE" test -f /root/.pi/agent/AGENTS.md
+  chk "工具链（nmap/httpx/ffuf）" docker run --rm --env-file "$CONFIG" "$IMAGE" \
+      bash -lc 'command -v nmap httpx ffuf sqlmap agent-browser >/dev/null'
+  chk "字典包" docker run --rm --env-file "$CONFIG" "$IMAGE" test -f /opt/pt/dicts/pt-dir-common.txt
+  chk "工作区可写" bash -c "mkdir -p '$WS_ROOT' && touch '$WS_ROOT/.doctor' && rm -f '$WS_ROOT/.doctor'"
+  if [ "$bad" -eq 0 ]; then ok "全部通过"; else warn "$bad 项异常"; fi
+}
+
+cmd_update(){
+  need_docker
+  log "拉取最新镜像"
+  docker pull "${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_UPDATE_VERSION:-latest}" || warn "镜像更新失败（可继续）"
+  log "容器内更新身份包与扩展"
+  docker run --rm --env-file "$CONFIG" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" \
+    bash -lc 'pi update --extensions || true'
+  ok "更新完成（镜像 tag 可用 PT_IMAGE 指定）"
+}
+
+cmd_down(){ need_docker; pick_engagement
+  docker rm -f "$(container_name "$ENG")" >/dev/null 2>&1 && ok "容器已删除（工作区保留：$WS）" || log "容器未在运行"; }
+
+cmd_clean(){ need_docker; pick_engagement
+  warn "将删除整个工作区：$WS"
+  read -rp "输入交战名确认删除: " c; [ "$c" = "$ENG" ] || die "已取消"
+  docker rm -f "$(container_name "$ENG")" >/dev/null 2>&1 || true
+  rm -rf "$WS"; ok "工作区已删除" ; }
+
+cmd_capture(){ need_docker; pick_engagement
+  case "${1:-}" in
+    on)  log "在容器内启动 mitmproxy 存档（写入 /work/02-证据/_flows）"
+         docker run -d --name "$(container_name "$ENG")-mitm" --network host \
+           -v "$WS:/work" "$IMAGE" \
+           bash -lc 'mkdir -p /work/02-证据/_flows && mitmdump -q -w /work/02-证据/_flows/flow-$(date +%s).flows' >/dev/null
+         ok "已开启";;
+    off) docker rm -f "$(container_name "$ENG")-mitm" >/dev/null 2>&1 && ok "已关闭" || true;;
+    *) die "用法: pt capture on|off";;
+  esac; }
+
+cmd_install(){ need_docker; pick_engagement
+  [ $# -ge 1 ] || die "用法: pt install <pkg>"
+  docker run --rm -v "$WS:/work" "$IMAGE" \
+    bash -lc "mkdir -p /work/.toolbox/bin && uv pip install --target /work/.toolbox/py '$1' || pip3 install --target /work/.toolbox/py '$1'"
+  ok "已装到工作区工具箱（容器内 PATH 已前置 /work/.toolbox/bin）"; }
+
+cmd_snapshot(){ need_docker; pick_engagement
+  [ $# -ge 1 ] || die "用法: pt snapshot <tag>"
+  docker commit "$(container_name "$ENG")" "$1" >/dev/null && ok "已提交为镜像 $1"; }
+
+cmd_fixperms(){ pick_engagement
+  docker run --rm -v "$WS_ROOT:/ws" "$IMAGE" chown -R "${UID:-1000}:${GID:-1000}" "/ws/$ENG" 2>/dev/null \
+    && ok "属主已改为 ${UID:-1000}:${GID:-1000}" || warn "修正失败（容器未运行时会跳过）"; }
+
+cmd_export_learnings(){ pick_engagement
+  local out="$WS/04-报告/learnings-$(date +%Y%m%d).md"
+  log "从 kb-local 与复盘生成脱敏经验导出 → $out"
+  docker run --rm -v "$WS:/work" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" bash -lc '
+    set -e
+    out="/work/04-报告/learnings-$(date +%Y%m%d).md"
+    { echo "# 本地经验导出（脱敏）"; echo; echo "生成时间: $(date -Iseconds)"; echo
+      echo "## 本地经验层"; for f in /root/.pi/agent/skills/kb-local/*.md; do [ -f "$f" ] && { echo "### $(basename "$f")"; cat "$f"; echo; }; done
+      echo "## 复盘"; for f in /work/04-报告/复盘.md; do [ -f "$f" ] && cat "$f"; done
+    } > "$out"
+    sed -i -E "s/((password|passwd|secret|token|api[_-]?key|AK|SK)[\"'\''=: ]+)[^ \"'\'']+/\1***/Ig" "$out" || true
+    wc -l "$out"' && ok "已导出（请人工复核脱敏效果）"; }
+
+cmd_selftest(){ need_docker
+  if [ -f "$(dirname "$0")/../ranges/selftest.sh" ]; then
+    bash "$(dirname "$0")/../ranges/selftest.sh" "$@"
+  else
+    warn "靶场自检脚本尚未就绪（M3 交付）：ranges/selftest.sh"
+  fi; }
+
+case "${1:-}" in
+  "") cmd_run ;;
+  init) shift; cmd_init ;;
+  doctor) shift; cmd_doctor ;;
+  update) shift; cmd_update ;;
+  down) shift; cmd_down ;;
+  clean) shift; cmd_clean ;;
+  capture) shift; cmd_capture "$@" ;;
+  install) shift; cmd_install "$@" ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
+  fix-perms) shift; cmd_fixperms ;;
+  export-learnings) shift; cmd_export_learnings ;;
+  selftest) shift; cmd_selftest "$@" ;;
+  mcp) shift; die "MCP 管理待 M1 实现（v1 默认零 MCP）：pt mcp add <fofa|shodan> --key <k>" ;;
+  resume) shift; cmd_run --continue ;;
+  run) shift; cmd_run "$@" ;;
+  help|-h|--help) sed -n '2,20p' "$0";;
+  *) cmd_run "$@" ;;
+esac
