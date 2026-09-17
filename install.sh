@@ -28,7 +28,19 @@ usage() {
   --version <ver>     镜像版本（默认 v0.1.0）
   --registry <host>   镜像仓库前缀（默认 ghcr.io/xxxe88）
   --local-image <tag> 使用本地已有的镜像 tag，不拉取
-  --offline <tar>     从离线镜像包安装（docker load）
+  # 离线包可能是 .tar / .tar.gz / .tar.zst：先直接 load（Docker ≥23 支持 zstd），
+  # 失败且是 zst 且有 zstd → 解压管道；两者都不行 → 给出明确指引（别让用户看天书报错）
+  if ! docker load -i "$PT_OFFLINE_TAR"; then
+    case "$PT_OFFLINE_TAR" in
+      *.zst|*.zstd)
+        if command -v zstd >/dev/null 2>&1; then
+          zstd -dc "$PT_OFFLINE_TAR" | docker load || die "解压管道加载失败"
+        else
+          die "读不了 zstd 离线包：请安装 zstd（sudo apt-get install -y zstd）或用较新的 Docker（≥23 可直接 load）"
+        fi ;;
+      *) die "docker load 失败：确认文件完整（sha256 可对 Release 说明）" ;;
+    esac
+  fi
   --skip-pull         跳过镜像拉取（仅装启动器与目录）
   -h, --help          显示帮助
 EOF
