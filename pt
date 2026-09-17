@@ -42,16 +42,25 @@ slug(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/
 pick_engagement(){
   mkdir -p "$WS_ROOT"
   if [ -n "${PT_ENG:-}" ]; then ENG="$PT_ENG"; else
-    mapfile -t dirs < <(cd "$WS_ROOT" 2>/dev/null && ls -1d */ 2>/dev/null | sed 's|/$||')
+    # 只认「像交战」的目录：含 00-简报.md 或 findings.jsonl（避免把杂目录/残留当成交战）
+    mapfile -t dirs < <(cd "$WS_ROOT" 2>/dev/null && for d in */; do
+        d="${d%/}"
+        [ -f "$d/00-简报.md" ] || [ -f "$d/findings.jsonl" ] || continue
+        printf '%s\n' "$d"
+      done)
     if [ "${#dirs[@]}" -eq 1 ]; then ENG="${dirs[0]}"
     elif [ "${#dirs[@]}" -eq 0 ]; then
-      read -rp "交战名（如 acme-2026q4）: " name; [ -n "$name" ] || die "必须给交战起名"
+      read -rp "交战名（如 acme-2026q4）: " name || true
+      [ -n "${name:-}" ] || die "必须给交战起名（非交互环境请设 PT_ENG=<名字>）"
       ENG="$(slug "$name")"
     else
       echo "选择交战:"; select d in "${dirs[@]}"; do ENG="$d"; break; done
     fi
   fi
-  ENG="$(slug "$ENG")"; WS="$WS_ROOT/$ENG"; mkdir -p "$WS"/{01-资产,02-证据,03-笔记,04-报告,chains,secrets,audit}
+  ENG="$(slug "$ENG")"
+  # 关键防护：ENG 解析为空会把骨架直接写进 workspaces/ 根目录（实测踩过），必须拦住
+  [ -n "$ENG" ] || die "交战名无效（得到空名）——请用 PT_ENG=<名字> 指定"
+  WS="$WS_ROOT/$ENG"; mkdir -p "$WS"/{01-资产,02-证据,03-笔记,04-报告,chains,secrets,audit}
   chmod 700 "$WS/secrets"
   [ -f "$WS/00-简报.md" ] || cat > "$WS/00-简报.md" <<EOF
 # $ENG
