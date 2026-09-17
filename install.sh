@@ -184,7 +184,15 @@ fi
 
 # ── 4. 启动器 ───────────────────────────────────────────
 log "4/6 安装 pt 启动器"
-BIN_DIR="$HOME/.local/bin"; mkdir -p "$BIN_DIR"
+# 安装位置：优先已在 PATH 且可写的系统目录（root 装 /usr/local/bin，装上就能用）；
+# 否则退回 ~/.local/bin，并在需要时把 PATH 写进 shell 配置（幂等，带标记）
+BIN_DIR=""
+for d in "${PT_BIN_DIR:-}" /usr/local/bin "$HOME/.local/bin" "$HOME/bin"; do
+  [ -n "$d" ] || continue
+  if [ -w "$d" ] 2>/dev/null || mkdir -p "$d" 2>/dev/null; then BIN_DIR="$d"; break; fi
+done
+[ -n "$BIN_DIR" ] || die "找不到可写的安装目录（可用 PT_BIN_DIR=<目录> 指定）"
+mkdir -p "$BIN_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo '.')"
 if [ -f "$SCRIPT_DIR/pt" ]; then
   install -m 0755 "$SCRIPT_DIR/pt" "$BIN_DIR/pt"
@@ -194,7 +202,15 @@ else
   chmod 0755 "$BIN_DIR/pt"
 fi
 ok "已安装 $BIN_DIR/pt"
-case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "请把 $BIN_DIR 加进 PATH: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;; esac
+if ! case ":$PATH:" in *":$BIN_DIR:"*) true ;; *) false ;; esac; then
+  # 不在 PATH：写进 shell 配置（幂等；已有标记则不重复）
+  RC="$HOME/.bashrc"; [ -n "${ZSH_VERSION:-}" ] && RC="$HOME/.zshrc"
+  if ! grep -qs "pentest-agent PATH" "$RC" 2>/dev/null; then
+    printf '\n# pentest-agent PATH\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$RC"
+    ok "已把 $BIN_DIR 写进 $RC"
+  fi
+  warn "当前 shell 生效：export PATH=\"$BIN_DIR:\$PATH\"（或重开终端 / source $RC）"
+fi
 
 # ── 5. 身份包清单（供容器内 pi 更新）─────────────────────
 log "5/6 身份包与扩展目录"
@@ -206,9 +222,9 @@ log "6/6 完成"
 cat <<EOF
 
 下一步：
-  1) $BIN_DIR/pt init      # 选模型、填 key、连通性自检
-  2) $BIN_DIR/pt           # 进入交战容器（首次会让你给交战起名）
-  3) $BIN_DIR/pt doctor    # 六项自检
+  1) pt init      # 选模型、填 key、连通性自检
+  2) pt           # 进入交战容器（首次会让你给交战起名）
+  3) pt doctor    # 八项自检
 
 说明：
   · 装卸载：$BIN_DIR/pt clean --purge 可删工作区；卸载 = 删 $PT_DIR 与 $BIN_DIR/pt，再 docker rmi $PT_IMAGE
