@@ -39,6 +39,24 @@ die(){ printf "${C_R}[x]${C_0} %s\n" "$*" >&2; exit 1; }
 need_docker(){ command -v docker >/dev/null || die "缺少 docker"; docker info >/dev/null 2>&1 || die "docker daemon 不可用"; }
 slug(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//' | cut -c1-40; }
 
+# 确保 pi 能解析到模型：config.env 已有网关 URL+KEY 但 models.json 缺失/未含 provider 时自动同步
+# （否则用户装完直接 pt 会看到 "Model xxx not found"）
+ensure_models_json(){
+  [ -n "${PT_BASE_URL:-}" ] && [ -n "${PT_API_KEY:-}" ] || return 0
+  local mj="$PI_HOME/models.json"
+  if [ -s "$mj" ] && python3 - "$mj" <<'PYX' 2>/dev/null; then
+import json,sys
+d=json.load(open(sys.argv[1])); p=d.get("providers",{}).get("gateway",{})
+ok = bool(p.get("models")) and p.get("api") == "openai-completions" and bool(p.get("baseUrl"))
+sys.exit(0 if ok else 1)
+PYX
+    return 0
+  fi
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || return 0
+  log "生成模型清单（pi 的 models.json）"
+  sync_gateway_models || warn "模型清单同步失败（可手动 pt init）"
+}
+
 # 把镜像内的 pt 身份同步到宿主 pi-home（幂等、秒级）
 # 为什么必须在宿主机做：pt 运行时把 ~/.pentest-agent/pi-home 挂到容器 /root/.pi/agent，
 # 会**遮住**镜像里构建期写入的身份；宿主这份若是空的（或首次），agent 就退化成裸 pi。
@@ -145,7 +163,7 @@ docker_args(){
 }
 
 cmd_run(){
-  need_docker; sync_identity; pick_engagement
+  need_docker; sync_identity; ensure_models_json; pick_engagement
   local cname; cname="$(container_name "$ENG")"
   if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
     log "接入已运行的交战容器 $cname"
@@ -248,7 +266,7 @@ print(f"[pt] models.json: gateway {len(models)} 个模型（{', '.join(ids[:4])}
 PYEOF
 }
 cmd_doctor(){
-  need_docker; sync_identity || true; local bad=0
+  need_docker; sync_identity || true; ensure_models_json || true; local bad=0
   chk(){ local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else warn "$n 失败"; bad=$((bad+1)); fi; }
   chk "docker daemon" docker info
   chk "镜像 $IMAGE" docker image inspect "$IMAGE"
