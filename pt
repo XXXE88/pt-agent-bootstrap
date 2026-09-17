@@ -79,8 +79,16 @@ pick_engagement(){
       done)
     if [ "${#dirs[@]}" -eq 1 ]; then ENG="${dirs[0]}"
     elif [ "${#dirs[@]}" -eq 0 ]; then
-      read -rp "交战名（如 acme-2026q4）: " name || true
-      [ -n "${name:-}" ] || die "必须给交战起名（非交互环境请设 PT_ENG=<名字>）"
+      tries=0
+      while :; do
+        if [ -t 0 ]; then read -rp "交战名（如 acme-2026q4）: " name || name=""; else read -r name || name=""; fi
+        if [ -n "${name:-}" ]; then break; fi
+        tries=$((tries+1))
+        if [ ! -t 0 ] || [ "$tries" -ge 3 ]; then
+          die "必须给交战起名（非交互环境请设 PT_ENG=<名字>，例如 PT_ENG=acme-2026q4 pt）"
+        fi
+        warn "名字不能为空，请再输一次（例如 acme-2026q4）"
+      done
       ENG="$(slug "$name")"
     else
       echo "选择交战:"; select d in "${dirs[@]}"; do ENG="$d"; break; done
@@ -119,10 +127,18 @@ docker_args(){
     -e "PT_ENG=$ENG" \
     -e "TZ=${TZ:-Asia/Shanghai}" \
     --memory "$MEM" --cpus "$CPUS" --pids-limit "$PIDS"
+  # 能力：CAPS 是逗号分隔（如 NET_RAW,NET_ADMIN）→ docker 需要**逐个** --cap-add
+  # （曾整串传入导致 `invalid CapAdd: unknown capability: "CAP_NET_RAW,CAP_NET_ADMIN"`）
+  capargs=()
+  for cap in ${CAPS//,/ }; do
+    cap="${cap#"${cap%%[![:space:]]*}"}"; cap="${cap%"${cap##*[![:space:]]}"}"   # trim
+    cap="${cap#CAP_}"
+    [ -n "$cap" ] && capargs+=(--cap-add "$cap")
+  done
   if [ "$NETWORK" = "host" ]; then
-    printf '%s\n' --network host --cap-add "$(printf '%s' "$CAPS" | tr ',' '\n' | sed 's/^/CAP_/' | paste -sd, -)"
+    printf '%s\n' "${capargs[@]}"
   else
-    printf '%s\n' --network pt-net --cap-add "$(printf '%s' "$CAPS" | tr ',' '\n' | sed 's/^/CAP_/' | paste -sd, -)"
+    printf '%s\n' --network pt-net "${capargs[@]}"
   fi
   [ -n "${HTTP_PROXY:-}" ] && printf '%s\n' -e "HTTP_PROXY=$HTTP_PROXY" -e "HTTPS_PROXY=${HTTPS_PROXY:-$HTTP_PROXY}"
   [ -n "${NO_PROXY:-}" ]   && printf '%s\n' -e "NO_PROXY=$NO_PROXY"
