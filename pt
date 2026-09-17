@@ -39,6 +39,29 @@ die(){ printf "${C_R}[x]${C_0} %s\n" "$*" >&2; exit 1; }
 need_docker(){ command -v docker >/dev/null || die "缺少 docker"; docker info >/dev/null 2>&1 || die "docker daemon 不可用"; }
 slug(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//' | cut -c1-40; }
 
+# 把用户选的模型写进 pi 的 settings.json：
+#   · subagents.defaultModel（身份包里硬编码的 deepseek-v4-flash 必须跟随用户配置）
+#   · 顶层 model（pi 的默认模型，未显式 --model 时生效）
+sync_settings_model(){
+  [ -n "${PT_MODEL:-}" ] || return 0
+  local sj="$PI_HOME/settings.json"
+  PT_MODEL_NAME="$PT_MODEL" PT_SETTINGS="$sj" python3 - <<'PYX' || { warn "settings.json 同步失败"; return 1; }
+import json, os, pathlib
+p = pathlib.Path(os.environ["PT_SETTINGS"])
+d = json.loads(p.read_text()) if p.exists() else {}
+model = os.environ["PT_MODEL_NAME"]
+changed = []
+if d.get("model") != model:
+    d["model"] = model; changed.append("model")
+sub = d.setdefault("subagents", {})
+if sub.get("defaultModel") != model:
+    sub["defaultModel"] = model; changed.append("subagents.defaultModel")
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+print("[pt] settings.json 模型已同步: " + (", ".join(changed) if changed else "已是最新"))
+PYX
+}
+
 # 确保 pi 能解析到模型：config.env 已有网关 URL+KEY 但 models.json 缺失/未含 provider 时自动同步
 # （否则用户装完直接 pt 会看到 "Model xxx not found"）
 ensure_models_json(){
@@ -163,18 +186,24 @@ docker_args(){
 }
 
 cmd_run(){
-  need_docker; sync_identity; ensure_models_json; pick_engagement
+  need_docker; sync_identity; ensure_models_json; sync_settings_model; pick_engagement
   local cname; cname="$(container_name "$ENG")"
+  # 默认把 config.env 里的模型/思考档传给 pi（否则 pi 用自带默认模型，与配置不符 —— 实测踩过）
+  # 用户显式给了 --model / --thinking 则不覆盖
+  pi_args=()
+  case " $* " in *" --model "*) ;; *) [ -n "${PT_MODEL:-}" ] && pi_args+=(--model "$PT_MODEL") ;; esac
+  case " $* " in *" --thinking "*) ;; *) [ -n "${PT_THINKING:-}" ] && pi_args+=(--thinking "$PT_THINKING") ;; esac
   if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
     log "接入已运行的交战容器 $cname"
     shift || true
-    docker exec -it -w /work "$cname" pi "$@"
+    docker exec -it -w /work "$cname" pi ${pi_args[@]+"${pi_args[@]}"} "$@"
   else
     log "启动交战容器 $cname（$IMAGE）· 网络 $NETWORK · ${MEM}/${CPUS}cpu"
     # shellcheck disable=SC2046
-    docker run $(docker_args "$WS") "$IMAGE" "$@"
+    docker run $(docker_args "$WS") "$IMAGE" ${pi_args[@]+"${pi_args[@]}"} "$@"
   fi
 }
+
 
 cmd_init(){
   need_docker
@@ -211,6 +240,7 @@ cmd_init(){
     log "同步模型清单到 pi-home/models.json"
     sync_gateway_models || warn "模型清单同步失败（可手动编辑 $PI_HOME/models.json）"
   fi
+  sync_settings_model
 
   log "连通性自检（容器内 pi 发一次最小请求）"
   local out rc
