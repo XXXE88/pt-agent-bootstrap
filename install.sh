@@ -11,6 +11,7 @@ PT_VERSION_DEFAULT="v0.1.0"   # 发布 tag 带 v 前缀（另有 latest）
 PT_DIR="${PT_DIR:-$HOME/.pentest-agent}"
 PT_IMAGE_REGISTRY="${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}"
 PT_OFFLINE_TAR=""
+PT_DOCKER_PROXY="${PT_DOCKER_PROXY:-}"
 PT_SKIP_PULL=0
 PT_LOCAL_IMAGE=""
 
@@ -28,6 +29,7 @@ usage() {
   --version <ver>     镜像版本（默认 v0.1.0）
   --registry <host>   镜像仓库前缀（默认 ghcr.io/xxxe88）
   --local-image <tag> 使用本地已有的镜像 tag，不拉取
+  --docker-proxy <url> 让 Docker 守护进程走代理（拉 ghcr.io 超时/慢时用；重启 dockerd）
   --offline <tar>     从离线镜像包安装（支持 .tar/.tar.gz/.tar.zst）
   --skip-pull         跳过镜像拉取（仅装启动器与目录）
   -h, --help          显示帮助
@@ -40,6 +42,7 @@ while [ $# -gt 0 ]; do
     --version) PT_VERSION_DEFAULT="$2"; shift 2 ;;
     --registry) PT_IMAGE_REGISTRY="$2"; shift 2 ;;
     --local-image) PT_LOCAL_IMAGE="$2"; PT_SKIP_PULL=1; shift 2 ;;
+    --docker-proxy) PT_DOCKER_PROXY="$2"; shift 2 ;;
     --offline) PT_OFFLINE_TAR="$2"; PT_SKIP_PULL=1; shift 2 ;;
     --skip-pull) PT_SKIP_PULL=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -125,6 +128,35 @@ PT_NETWORK=host
 PT_CAPS=NET_RAW,NET_ADMIN
 
 # ── 镜像 ──
+# ── Docker 守护进程代理（拉镜像走的是守护进程，宿主 shell 的代理对它无效）──
+# 实测：不配代理时 ghcr.io 的 blob CDN（pkg-containers.githubusercontent.com）会在国内 TLS 超时。
+configure_docker_proxy(){
+  local url="$1" cfg=/etc/docker/daemon.json
+  [ -n "$url" ] || return 0
+  log "配置 Docker 守护进程代理: $url"
+  if [ ! -w /etc/docker ] && [ "$(id -u)" != "0" ]; then
+    warn "需要 root 才能改 $cfg（试试 sudo）"; return 1
+  fi
+  mkdir -p /etc/docker
+  [ -f "$cfg" ] && cp -a "$cfg" "$cfg.bak-$(date +%Y%m%d%H%M%S)"
+  PT_PROXY_URL="$url" PT_CFG="$cfg" python3 - <<'PYX' || { warn "写 $cfg 失败"; return 1; }
+import json, os, pathlib
+cfg = pathlib.Path(os.environ["PT_CFG"])
+d = json.loads(cfg.read_text()) if cfg.exists() else {}
+d["proxies"] = {
+    "http-proxy": os.environ["PT_PROXY_URL"],
+    "https-proxy": os.environ["PT_PROXY_URL"],
+    "no-proxy": "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal",
+}
+cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+PYX
+  if service docker restart >/dev/null 2>&1; then :; else pkill -x dockerd 2>/dev/null; sleep 4; nohup dockerd >/tmp/dockerd.log 2>&1 & fi
+  for _ in $(seq 1 20); do docker info >/dev/null 2>&1 && break; sleep 2; done
+  docker info 2>/dev/null | grep -qi "HTTP Proxy" && ok "守护进程代理已生效（容器需重启后恢复）" || warn "代理似乎未生效，可检查 $cfg 与 /tmp/dockerd.log"
+}
+
+configure_docker_proxy "$PT_DOCKER_PROXY"
+
 PT_IMAGE=${PT_IMAGE}
 
 # ── 模型（BYO：默认 DeepSeek V4.1 Flash；可换任意 OpenAI 兼容）──
@@ -184,6 +216,7 @@ if [ -n "${PT_GHCR_TOKEN:-}" ]; then
 fi
     if ! docker pull "$PT_IMAGE"; then
       die "镜像拉取失败。可选：
+  → 【拉取超时/慢】让守护进程走宿主代理：bash install.sh --docker-proxy "${http_proxy:-http://<宿主IP>:7890}"
   → 【私有包】带上自己的 GitHub PAT：PT_GHCR_TOKEN=<token> PT_GHCR_USER=<用户名> bash install.sh
   → 或把包设为 public（GitHub → Packages → pt-agent → Package settings → Change visibility）
   → 国内加速：配置 docker 镜像加速后重试（见 README）
