@@ -2,7 +2,7 @@
 # pt — PT Agent 启动器（宿主机侧）
 #   pt                进入当前交战容器（无则新建）
 #   pt init           配置模型与密钥 + 连通性自检
-#   pt doctor         六项自检
+#   pt doctor         八项自检
 #   pt update         更新镜像与身份包
 #   pt down           停止并删除交战容器（保留工作区）
 #   pt clean          删除工作区（二次确认）；--purge 连容器一起
