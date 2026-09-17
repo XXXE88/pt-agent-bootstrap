@@ -21,7 +21,7 @@ CONFIG="$PT_HOME/config.env"
 [ -f "$CONFIG" ] || { echo "未找到 $CONFIG —— 先运行 installer/install.sh" >&2; exit 1; }
 set -a; . "$CONFIG"; set +a
 
-IMAGE="${PT_IMAGE:-ghcr.io/xxxe88/pt-agent:0.1.0}"
+IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.1.0}}"   # 发布 tag 为 v0.1.0（另有 latest）
 WS_ROOT="$PT_HOME/workspaces"
 PI_HOME="$PT_HOME/pi-home"
 NETWORK="${PT_NETWORK:-host}"
@@ -144,10 +144,10 @@ cmd_doctor(){
   chk "镜像 $IMAGE" docker image inspect "$IMAGE"
   chk "config.env 权限 600" bash -c "[ \"\$(stat -c %a '$CONFIG')\" = 600 ]"
   chk "pi 运行时" docker run --rm --env-file "$CONFIG" "$IMAGE" pi --version
-  chk "身份包 AGENTS.md" docker run --rm --env-file "$CONFIG" "$IMAGE" test -f /root/.pi/agent/AGENTS.md
-  chk "工具链（nmap/httpx/ffuf）" docker run --rm --env-file "$CONFIG" "$IMAGE" \
-      bash -lc 'command -v nmap httpx ffuf sqlmap agent-browser >/dev/null'
-  chk "字典包" docker run --rm --env-file "$CONFIG" "$IMAGE" test -f /opt/pt/dicts/pt-dir-common.txt
+  chk "身份包 AGENTS.md" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" -c "test -f /root/.pi/agent/AGENTS.md"
+  chk "工具链（nmap/httpx/ffuf）" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" \
+      -c 'command -v nmap httpx ffuf sqlmap agent-browser >/dev/null'
+  chk "字典包" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" -c "test -f /opt/pt/dicts/pt-dir-common.txt"
   chk "工作区可写" bash -c "mkdir -p '$WS_ROOT' && touch '$WS_ROOT/.doctor' && rm -f '$WS_ROOT/.doctor'"
   if [ "$bad" -eq 0 ]; then ok "全部通过"; else warn "$bad 项异常"; fi
 }
@@ -157,8 +157,8 @@ cmd_update(){
   log "拉取最新镜像"
   docker pull "${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_UPDATE_VERSION:-latest}" || warn "镜像更新失败（可继续）"
   log "容器内更新身份包与扩展"
-  docker run --rm --env-file "$CONFIG" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" \
-    bash -lc 'pi update --extensions || true'
+  docker run --rm --entrypoint bash --env-file "$CONFIG" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" \
+    -c 'pi update --extensions || true'
   ok "更新完成（镜像 tag 可用 PT_IMAGE 指定）"
 }
 
@@ -175,8 +175,8 @@ cmd_capture(){ need_docker; pick_engagement
   case "${1:-}" in
     on)  log "在容器内启动 mitmproxy 存档（写入 /work/02-证据/_flows）"
          docker run -d --name "$(container_name "$ENG")-mitm" --network host \
-           -v "$WS:/work" "$IMAGE" \
-           bash -lc 'mkdir -p /work/02-证据/_flows && mitmdump -q -w /work/02-证据/_flows/flow-$(date +%s).flows' >/dev/null
+           --entrypoint bash -v "$WS:/work" "$IMAGE" \
+           -c 'mkdir -p /work/02-证据/_flows && mitmdump -q -w /work/02-证据/_flows/flow-$(date +%s).flows' >/dev/null
          ok "已开启";;
     off) docker rm -f "$(container_name "$ENG")-mitm" >/dev/null 2>&1 && ok "已关闭" || true;;
     *) die "用法: pt capture on|off";;
@@ -184,8 +184,8 @@ cmd_capture(){ need_docker; pick_engagement
 
 cmd_install(){ need_docker; pick_engagement
   [ $# -ge 1 ] || die "用法: pt install <pkg>"
-  docker run --rm -v "$WS:/work" "$IMAGE" \
-    bash -lc "mkdir -p /work/.toolbox/bin && uv pip install --target /work/.toolbox/py '$1' || pip3 install --target /work/.toolbox/py '$1'"
+  docker run --rm --entrypoint bash -v "$WS:/work" "$IMAGE" \
+    -c "mkdir -p /work/.toolbox/bin && uv pip install --target /work/.toolbox/py '$1' || pip3 install --target /work/.toolbox/py '$1'"
   ok "已装到工作区工具箱（容器内 PATH 已前置 /work/.toolbox/bin）"; }
 
 cmd_snapshot(){ need_docker; pick_engagement
@@ -193,13 +193,13 @@ cmd_snapshot(){ need_docker; pick_engagement
   docker commit "$(container_name "$ENG")" "$1" >/dev/null && ok "已提交为镜像 $1"; }
 
 cmd_fixperms(){ pick_engagement
-  docker run --rm -v "$WS_ROOT:/ws" "$IMAGE" chown -R "${UID:-1000}:${GID:-1000}" "/ws/$ENG" 2>/dev/null \
+  docker run --rm --entrypoint chown -v "$WS_ROOT:/ws" "$IMAGE" -R "${UID:-1000}:${GID:-1000}" "/ws/$ENG" 2>/dev/null \
     && ok "属主已改为 ${UID:-1000}:${GID:-1000}" || warn "修正失败（容器未运行时会跳过）"; }
 
 cmd_export_learnings(){ pick_engagement
   local out="$WS/04-报告/learnings-$(date +%Y%m%d).md"
   log "从 kb-local 与复盘生成脱敏经验导出 → $out"
-  docker run --rm -v "$WS:/work" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" bash -lc '
+  docker run --rm --entrypoint bash -v "$WS:/work" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c '
     set -e
     out="/work/04-报告/learnings-$(date +%Y%m%d).md"
     { echo "# 本地经验导出（脱敏）"; echo; echo "生成时间: $(date -Iseconds)"; echo
@@ -229,7 +229,19 @@ case "${1:-}" in
   fix-perms) shift; cmd_fixperms ;;
   export-learnings) shift; cmd_export_learnings ;;
   selftest) shift; cmd_selftest "$@" ;;
-  mcp) shift; die "MCP 管理待 M1 实现（v1 默认零 MCP）：pt mcp add <fofa|shodan> --key <k>" ;;
+  mcp) shift
+    case "${1:-}" in
+      ""|list) echo "v1 默认零 MCP（白名单为空）。可用：pt mcp add <name> -- <command> [args...]"; 
+               echo "内置模板：fofa / shodan / searxng（需自备 key）";;
+      add)
+        shift
+        case "${1:-}" in
+          fofa|shodan|searxng) die "模板已预留但未随 v1 发布（需自备 key 与合规确认）：$1";;
+          *) shift 2>/dev/null || true
+             die "自定义 MCP 需编辑 $PT_HOME/pi-home/mcp.json 后重启容器（v1 不做自动写配置）";;
+        esac;;
+      *) die "用法：pt mcp [list|add]";;
+    esac ;;
   resume) shift; cmd_run --continue ;;
   run) shift; cmd_run "$@" ;;
   help|-h|--help) sed -n '2,20p' "$0";;

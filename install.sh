@@ -165,10 +165,15 @@ else
     ok "镜像已存在: $PT_IMAGE"
   else
     log "  拉取 $PT_IMAGE（约 3 GB，国内可用镜像加速）"
+# 私有镜像仓库：给出 GHCR 凭据时不弹窗登录（GHCR 的 pt-agent 包默认 private）
+if [ -n "${PT_GHCR_TOKEN:-}" ]; then
+  echo "${PT_GHCR_TOKEN}" | docker login ghcr.io -u "${PT_GHCR_USER:-$(git config user.name || echo user)}" --password-stdin \
+    && echo "[ok] 已登录 ghcr.io" || echo "[!] ghcr.io 登录失败（镜像若为 public 可忽略）"
+fi
     if ! docker pull "$PT_IMAGE"; then
       die "镜像拉取失败。可选：
   → 配置 docker 镜像加速后重试（见 README）
-  → 使用离线包: bash install.sh --offline pt-agent-0.1.0.tar.zst
+  → 使用离线包: bash install.sh --offline pt-agent-v0.1.0.tar.zst
   → 如果镜像已在本机: bash install.sh --local-image <tag>"
     fi
     ok "镜像已就绪"
