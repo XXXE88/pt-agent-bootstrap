@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-PT_VERSION_DEFAULT="0.1.0"
+PT_VERSION_DEFAULT="v0.1.0"   # 发布 tag 带 v 前缀（另有 latest）
 PT_DIR="${PT_DIR:-$HOME/.pentest-agent}"
 PT_IMAGE_REGISTRY="${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}"
 PT_OFFLINE_TAR=""
@@ -25,7 +25,7 @@ usage() {
 用法: install.sh [选项]
 
   --dir <path>        运行时目录（默认 ~/.pentest-agent）
-  --version <ver>     镜像版本（默认 0.1.0）
+  --version <ver>     镜像版本（默认 v0.1.0）
   --registry <host>   镜像仓库前缀（默认 ghcr.io/xxxe88）
   --local-image <tag> 使用本地已有的镜像 tag，不拉取
   --offline <tar>     从离线镜像包安装（docker load）
@@ -172,7 +172,9 @@ if [ -n "${PT_GHCR_TOKEN:-}" ]; then
 fi
     if ! docker pull "$PT_IMAGE"; then
       die "镜像拉取失败。可选：
-  → 配置 docker 镜像加速后重试（见 README）
+  → 【私有包】带上自己的 GitHub PAT：PT_GHCR_TOKEN=<token> PT_GHCR_USER=<用户名> bash install.sh
+  → 或把包设为 public（GitHub → Packages → pt-agent → Package settings → Change visibility）
+  → 国内加速：配置 docker 镜像加速后重试（见 README）
   → 使用离线包: bash install.sh --offline pt-agent-v0.1.0.tar.zst
   → 如果镜像已在本机: bash install.sh --local-image <tag>"
     fi
