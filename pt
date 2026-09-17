@@ -126,26 +126,82 @@ cmd_init(){
     2) read -rp "provider 名（anthropic/openai/...）: " p; read -rsp "API KEY: " k; echo
        sed -i '/^#\? *PT_PROVIDER=/d' "$CONFIG"; echo "PT_PROVIDER=$p" >> "$CONFIG"
        echo "${p^^}_API_KEY=$k" >> "$CONFIG";;
-    3) read -rp "网关 baseURL（…/v1）: " u; read -rsp "网关 API KEY: " k; echo
+    3) # baseURL 规范化：允许只填主机名或带尾斜杠，自动补 /v1
+       read -rp "网关 baseURL（…/v1；默认 ${PT_BASE_URL:-http://127.0.0.1:8000/v1}）: " u
+       u="${u:-${PT_BASE_URL:-}}"
+       u="${u%/}"
+       case "$u" in */v1) ;; *) u="$u/v1" ;; esac
+       read -rsp "网关 API KEY（回车保留原值）: " k; echo
+       [ -n "$k" ] || k="${PT_API_KEY:-}"
+       [ -n "$k" ] || die "API KEY 不能为空"
        sed -i '/^#\? *PT_PROVIDER=\|^#\? *PT_BASE_URL=\|^#\? *PT_API_KEY=/d' "$CONFIG"
        { echo "PT_PROVIDER=gateway"; echo "PT_BASE_URL=$u"; echo "PT_API_KEY=$k"; } >> "$CONFIG";;
   esac
   read -rp "默认模型 [默认 ${PT_MODEL:-deepseek-v4-flash}]: " m
-  if [ -n "$m" ]; then sed -i "s|^PT_MODEL=.*|PT_MODEL=$m|" "$CONFIG"; fi
+  if [ -n "$m" ]; then sed -i "s|^PT_MODEL=.*|PT_MODEL=$m|" "$CONFIG"; else sed -i "s|^PT_MODEL=.*|PT_MODEL=${PT_MODEL:-deepseek-v4-flash}|" "$CONFIG"; fi
   chmod 600 "$CONFIG"
   ok "已写入 $CONFIG"
-  log "连通性自检（发一次最小请求）"
-  local extra=()
-  [ -n "${PT_BASE_URL:-}" ] && extra+=(--base-url "$PT_BASE_URL")
-  [ -n "${PT_API_KEY:-}" ] && extra+=(--api-key "$PT_API_KEY")
-  if docker run --rm --env-file "$CONFIG" "$IMAGE" \
-      pi -p ${extra[@]+"${extra[@]}"} --model "${PT_MODEL:-deepseek-v4-flash}" "只回复两个字符：OK" 2>&1 | tail -5; then
-    ok "模型连通"
+
+  # ── 关键：pi 只从 ~/.pi/agent/models.json 解析 provider/model ──────────────
+  # （pi v0.85 没有 --base-url/--api-key 这些开关；早前自检用它们 → 必然假失败）
+  if [ "${PT_PROVIDER:-gateway}" = "gateway" ] && [ -n "${PT_BASE_URL:-}" ]; then
+    log "同步模型清单到 pi-home/models.json"
+    sync_gateway_models || warn "模型清单同步失败（可手动编辑 $PI_HOME/models.json）"
+  fi
+
+  log "连通性自检（容器内 pi 发一次最小请求）"
+  local out rc
+  out="$(docker run --rm -v "$PI_HOME:/root/.pi/agent" --env-file "$CONFIG" "$IMAGE" \
+        pi -p --model "${PT_MODEL:-deepseek-v4-flash}" "Reply with exactly: OK" 2>&1)"; rc=$?
+  # 判定：退出码 0 + 有非空回复 + 无错误字样（模型可能回中文"好的"，不能只认 OK）
+  if [ "$rc" = "0" ] && [ -n "$out" ] && ! printf '%s' "$out" | grep -qiE "not found|Unknown option|No API key|^Error"; then
+    ok "模型连通（${PT_MODEL:-deepseek-v4-flash}）"
   else
-    warn "自检失败：检查 key / baseURL / 模型名（可重跑 pt init）"
+    warn "自检失败（退出码 $rc）。最后几行："
+    printf '%s\n' "$out" | tail -6 | sed 's/^/     /'
+    echo "     排查：① 密钥是否正确 ② baseURL 是否以 /v1 结尾 ③ 模型名是否在清单里（pt models 可刷新）"
   fi
 }
 
+# 从网关联表 /v1/models 生成 pi 的 models.json（保留其它 provider；先备份）
+sync_gateway_models(){
+  local base="${PT_BASE_URL%/}" key="${PT_API_KEY:-}" tmp ids
+  tmp="$(mktemp)"
+  ids="$(curl -sS -m 15 -H "Authorization: Bearer ${key}" "${base}/models" 2>/dev/null \
+        | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+print("\n".join(m.get("id","") for m in (d.get("data") or d.get("models") or []) if m.get("id")))' 2>/dev/null)" || true
+  [ -n "$ids" ] || { warn "网关未返回模型清单（${base}/models）"; return 1; }
+  PT_IDS="$ids" PT_BASE="$base" PT_KEY="$key" PI_JSON="$PI_HOME/models.json" python3 - <<'PYEOF'
+import json, os, pathlib
+ids = [x for x in os.environ["PT_IDS"].splitlines() if x.strip()]
+path = pathlib.Path(os.environ["PI_JSON"])
+old = json.loads(path.read_text()) if path.is_file() else {"providers": {}}
+if path.is_file():
+    pathlib.Path(str(path) + ".bak").write_text(json.dumps(old, ensure_ascii=False, indent=1))
+cw = int(os.environ.get("PT_CONTEXT_WINDOW", "262144"))
+think = {"off": None, "minimal": None, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
+old_models = {m.get("id"): m for m in old.get("providers", {}).get("gateway", {}).get("models", [])}
+models = []
+for i in ids:
+    m = dict(old_models.get(i) or {"id": i, "name": i, "contextWindow": cw, "reasoning": True})
+    m.setdefault("thinkingLevelMap", think)
+    models.append(m)
+# 注意字段名：pi 读的是 "api"（不是 "type"）——写错会报
+#   Provider "gateway": ... no "api" specified  → 模型全部不可见（实测踩过）
+old.setdefault("providers", {})["gateway"] = {
+    "baseUrl": os.environ["PT_BASE"],
+    "apiKey": os.environ["PT_KEY"],
+    "api": "openai-completions",
+    "models": models,
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(old, ensure_ascii=False, indent=1))
+path.chmod(0o600)
+print(f"[pt] models.json: gateway {len(models)} 个模型（{', '.join(ids[:4])}…）")
+PYEOF
+}
 cmd_doctor(){
   need_docker; local bad=0
   chk(){ local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else warn "$n 失败"; bad=$((bad+1)); fi; }
