@@ -214,8 +214,17 @@ fi
 
 # ── 5. 身份包清单（供容器内 pi 更新）─────────────────────
 log "5/6 身份包与扩展目录"
-mkdir -p "$PT_DIR/pi-home/extensions"
-ok "pi-home 就绪（身份在镜像内；容器内可 pi update --extensions 更新）"
+mkdir -p "$PT_DIR/pi-home/extensions" "$PT_DIR/pi-home/skills" "$PT_DIR/pi-home/agents"
+# 关键：身份必须**物化到宿主 pi-home**——运行时会把它挂到容器 /root/.pi/agent，
+# 从而遮住镜像内构建期写入的身份；宿主这份若为空，agent 会退化成裸 pi（实测踩过）。
+# 提取来源＝镜像（唯一真相源）；由 pt doctor / pt run 自愈，这里先做一次保证首启正确。
+if [ -x "$BIN_DIR/pt" ]; then
+  ( cd /tmp && HOME="$HOME" PT_IMAGE="$PT_IMAGE" "$BIN_DIR/pt" doctor >/tmp/pt-first-doctor.log 2>&1 ) \
+    && ok "身份已物化 + 八项自检通过（详见 /tmp/pt-first-doctor.log）" \
+    || warn "首启自检有告警（可稍后跑 pt doctor 查看；日志 /tmp/pt-first-doctor.log）"
+else
+  ok "pi-home 就绪（首次运行 pt 时会自动物化身份）"
+fi
 
 # ── 6. 收尾 ─────────────────────────────────────────────
 log "6/6 完成"
@@ -224,7 +233,7 @@ cat <<EOF
 下一步：
   1) pt init      # 选模型、填 key、连通性自检
   2) pt           # 进入交战容器（首次会让你给交战起名）
-  3) pt doctor    # 八项自检
+  3) pt doctor    # 十一项自检（含身份/工具链/字典/工作区）
 
 说明：
   · 装卸载：$BIN_DIR/pt clean --purge 可删工作区；卸载 = 删 $PT_DIR 与 $BIN_DIR/pt，再 docker rmi $PT_IMAGE

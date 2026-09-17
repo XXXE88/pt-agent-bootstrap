@@ -39,6 +39,35 @@ die(){ printf "${C_R}[x]${C_0} %s\n" "$*" >&2; exit 1; }
 need_docker(){ command -v docker >/dev/null || die "缺少 docker"; docker info >/dev/null 2>&1 || die "docker daemon 不可用"; }
 slug(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//' | cut -c1-40; }
 
+# 把镜像内的 pt 身份同步到宿主 pi-home（幂等、秒级）
+# 为什么必须在宿主机做：pt 运行时把 ~/.pentest-agent/pi-home 挂到容器 /root/.pi/agent，
+# 会**遮住**镜像里构建期写入的身份；宿主这份若是空的（或首次），agent 就退化成裸 pi。
+# 实测踩过：宿主 AGENTS.md 0 字节 + skills/agents 空目录 → agent 自称"pi 编码智能体"。
+sync_identity(){
+  local dest="$PI_HOME" force="${1:-}"
+  local need=0
+  [ -s "$dest/AGENTS.md" ] || need=1
+  [ "$(ls -1 "$dest/skills" 2>/dev/null | wc -l)" -ge 5 ] || need=1
+  [ "$(ls -1 "$dest/agents" 2>/dev/null | wc -l)" -ge 3 ] || need=1
+  if [ "$need" = "0" ] && [ "$force" != "force" ]; then return 0; fi
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || { warn "镜像不存在，无法同步身份：$IMAGE"; return 1; }
+  log "同步身份包：镜像 → $dest（一次性，秒级）"
+  local cid; cid="$(docker create "$IMAGE")" || return 1
+  mkdir -p "$dest"
+  for item in AGENTS.md skills agents; do
+    docker rm -f "$cid" >/dev/null 2>&1
+    cid="$(docker create "$IMAGE")"
+    docker cp "$cid:/root/.pi/agent/$item" "$dest/" >/dev/null 2>&1 || warn "  缺失：$item"
+  done
+  # 扩展（roe-gate 闸门 + subagent 配置）只补缺，不覆盖宿主已有扩展
+  mkdir -p "$dest/extensions"
+  docker cp "$cid:/root/.pi/agent/extensions/roe-gate.ts" "$dest/extensions/" >/dev/null 2>&1 || true
+  mkdir -p "$dest/extensions/subagent"
+  docker cp "$cid:/root/.pi/agent/extensions/subagent/config.json" "$dest/extensions/subagent/" >/dev/null 2>&1 || true
+  docker rm -f "$cid" >/dev/null 2>&1 || true
+  ok "身份已就绪（技能 $(ls -1 "$dest/skills" 2>/dev/null | wc -l) · 子智能体 $(ls -1 "$dest/agents" 2>/dev/null | wc -l) · AGENTS.md $(stat -c%s "$dest/AGENTS.md" 2>/dev/null || echo 0) 字节）"
+}
+
 pick_engagement(){
   mkdir -p "$WS_ROOT"
   if [ -n "${PT_ENG:-}" ]; then ENG="$PT_ENG"; else
@@ -100,7 +129,7 @@ docker_args(){
 }
 
 cmd_run(){
-  need_docker; pick_engagement
+  need_docker; sync_identity; pick_engagement
   local cname; cname="$(container_name "$ENG")"
   if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
     log "接入已运行的交战容器 $cname"
@@ -203,13 +232,16 @@ print(f"[pt] models.json: gateway {len(models)} 个模型（{', '.join(ids[:4])}
 PYEOF
 }
 cmd_doctor(){
-  need_docker; local bad=0
+  need_docker; sync_identity || true; local bad=0
   chk(){ local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else warn "$n 失败"; bad=$((bad+1)); fi; }
   chk "docker daemon" docker info
   chk "镜像 $IMAGE" docker image inspect "$IMAGE"
   chk "config.env 权限 600" bash -c "[ \"\$(stat -c %a '$CONFIG')\" = 600 ]"
   chk "pi 运行时" docker run --rm --env-file "$CONFIG" "$IMAGE" pi --version
-  chk "身份包 AGENTS.md" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" -c "test -f /root/.pi/agent/AGENTS.md"
+  # 身份要查"内容"而不是"存在"（曾出现宿主空文件假通过）
+  chk "身份 AGENTS.md（非空）" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c "test -s /root/.pi/agent/AGENTS.md"
+  chk "身份 技能 ≥5" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c "[ \$(ls -1 /root/.pi/agent/skills 2>/dev/null | wc -l) -ge 5 ]"
+  chk "身份 子智能体 ≥3" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c "[ \$(ls -1 /root/.pi/agent/agents 2>/dev/null | wc -l) -ge 3 ]"
   chk "工具链（nmap/httpx/ffuf）" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" \
       -c 'command -v nmap httpx ffuf sqlmap agent-browser >/dev/null'
   chk "字典包" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" -c "test -f /opt/pt/dicts/pt-dir-common.txt"
@@ -218,6 +250,7 @@ cmd_doctor(){
 }
 
 cmd_update(){
+  sync_identity force
   need_docker
   log "拉取最新镜像"
   docker pull "${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_UPDATE_VERSION:-latest}" || warn "镜像更新失败（可继续）"
