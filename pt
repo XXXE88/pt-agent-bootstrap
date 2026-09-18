@@ -2,7 +2,8 @@
 # pt — PT Agent 启动器（宿主机侧）
 #   pt                进入当前交战容器（无则新建）
 #   pt init           配置模型与密钥 + 连通性自检
-#   pt doctor         八项自检
+#   pt models         刷新模型清单
+#   pt doctor         十一项自检
 #   pt update         更新镜像与身份包
 #   pt down           停止并删除交战容器（保留工作区）
 #   pt clean          删除工作区（二次确认）；--purge 连容器一起
@@ -21,7 +22,7 @@ CONFIG="$PT_HOME/config.env"
 [ -f "$CONFIG" ] || { echo "未找到 $CONFIG —— 先运行 installer/install.sh" >&2; exit 1; }
 set -a; . "$CONFIG"; set +a
 
-IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.1.0}}"   # 发布 tag 为 v0.1.0（另有 latest）
+IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.2.0}}"   # 发布 tag 由 PT_IMAGE_TAG 覆盖（默认 v0.2.0，另有 latest）
 WS_ROOT="$PT_HOME/workspaces"
 PI_HOME="$PT_HOME/pi-home"
 NETWORK="${PT_NETWORK:-host}"
@@ -44,10 +45,10 @@ slug(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/
 #   · 顶层 model（pi 的默认模型，未显式 --model 时生效）
 sync_settings_model(){
   [ -n "${PT_MODEL:-}" ] || return 0
-  local sj="$PI_HOME/settings.json"
-  PT_MODEL_NAME="$PT_MODEL" PT_SETTINGS="$sj" python3 - <<'PYX' || { warn "settings.json 同步失败"; return 1; }
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || return 0
+  host_py -v "$PI_HOME:/cfg" -e "PT_MODEL_NAME=${PT_MODEL}" <<'PYX' || { warn "settings.json 同步失败"; return 1; }
 import json, os, pathlib
-p = pathlib.Path(os.environ["PT_SETTINGS"])
+p = pathlib.Path("/cfg/settings.json")
 d = json.loads(p.read_text()) if p.exists() else {}
 model = os.environ["PT_MODEL_NAME"]
 changed = []
@@ -56,28 +57,141 @@ if d.get("model") != model:
 sub = d.setdefault("subagents", {})
 if sub.get("defaultModel") != model:
     sub["defaultModel"] = model; changed.append("subagents.defaultModel")
+# UI 品牌项：隐藏 pi 自带的启动头（品牌名/自述文案在镜像侧改名，这里是即时生效的开关）
+if d.get("quietStartup") is not True:
+    d["quietStartup"] = True; changed.append("quietStartup")
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
 print("[pt] settings.json 模型已同步: " + (", ".join(changed) if changed else "已是最新"))
 PYX
 }
 
+
+# 模型元数据表兜底：镜像内有就用镜像的（新镜像），否则写一份内置默认（旧镜像/离线也能用）
+# 说明：网关 /v1/models 不暴露上下文长度，只能靠这张表；用户可自行编辑后跑 pt models
+ensure_model_metadata(){
+  local dst="$PI_HOME/model-metadata.json"
+  [ -s "$dst" ] && return 0
+  if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    local cid; cid="$(docker create "$IMAGE" 2>/dev/null)" || true
+    if [ -n "$cid" ]; then
+      docker cp "$cid:/opt/pt/identity/model-metadata.json" "$dst" >/dev/null 2>&1 && { docker rm -f "$cid" >/dev/null 2>&1; return 0; }
+      docker rm -f "$cid" >/dev/null 2>&1 || true
+    fi
+  fi
+  mkdir -p "$PI_HOME"
+  cat > "$dst" <<'JSON'
+{
+  "_说明": "网关不暴露上下文长度，在此维护。匹配顺序 byId > byPrefix(最长) > default；pt 同步时只填不降，PT_CONTEXT_WINDOW 可强制覆盖。",
+  "default": { "contextWindow": 262144 },
+  "byPrefix": {
+    "deepseek-v4": { "contextWindow": 1048576 },
+    "deepseek-v3": { "contextWindow": 131072 },
+    "deepseek-r": { "contextWindow": 131072 },
+    "claude-": { "contextWindow": 1048576 },
+    "gpt-4": { "contextWindow": 400000 },
+    "gpt-5": { "contextWindow": 400000 },
+    "codex-": { "contextWindow": 400000 },
+    "o3": { "contextWindow": 200000 },
+    "glm-5": { "contextWindow": 262144 },
+    "glm-4": { "contextWindow": 131072 },
+    "kimi": { "contextWindow": 262144 },
+    "qwen3": { "contextWindow": 262144 },
+    "gemini": { "contextWindow": 1048576 }
+  },
+  "byId": {
+    "deepseek-v4.1-flash": { "contextWindow": 1048576 },
+    "deepseek-v4-flash": { "contextWindow": 1048576 },
+    "deepseek-v4-pro": { "contextWindow": 1048576 }
+  }
+}
+JSON
+}
+
 # 确保 pi 能解析到模型：config.env 已有网关 URL+KEY 但 models.json 缺失/未含 provider 时自动同步
 # （否则用户装完直接 pt 会看到 "Model xxx not found"）
 ensure_models_json(){
   [ -n "${PT_BASE_URL:-}" ] && [ -n "${PT_API_KEY:-}" ] || return 0
+  ensure_model_metadata
   local mj="$PI_HOME/models.json"
-  if [ -s "$mj" ] && python3 - "$mj" <<'PYX' 2>/dev/null; then
-import json,sys
-d=json.load(open(sys.argv[1])); p=d.get("providers",{}).get("gateway",{})
-ok = bool(p.get("models")) and p.get("api") == "openai-completions" and bool(p.get("baseUrl"))
-sys.exit(0 if ok else 1)
-PYX
-    return 0
-  fi
+  if [ -s "$mj" ] && ! models_need_sync; then return 0; fi
   docker image inspect "$IMAGE" >/dev/null 2>&1 || return 0
-  log "生成模型清单（pi 的 models.json）"
+  log "同步模型清单（pi 的 models.json）"
   sync_gateway_models || warn "模型清单同步失败（可手动 pt init）"
+}
+
+# models.json 是否需要重新同步：缺失 / gateway provider 不完整 / 元数据表里有"可上调"的上下文档位
+models_need_sync(){
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || return 1        # 无镜像 → 认为需要同步（会走 ensure 流程）
+  host_py -v "$PI_HOME:/cfg" -e "PT_CTX_OVERRIDE=${PT_CONTEXT_WINDOW:-}" <<'PYX'
+import json, os, pathlib, sys
+mj = pathlib.Path("/cfg/models.json")
+try:
+    d = json.loads(mj.read_text())
+except Exception:
+    sys.exit(0)
+gw = (d.get("providers") or {}).get("gateway") or {}
+if not gw.get("models") or gw.get("api") != "openai-completions" or not gw.get("baseUrl"):
+    sys.exit(0)
+mp = pathlib.Path("/cfg/model-metadata.json")
+meta = {}
+if mp.is_file():
+    try:
+        meta = json.loads(mp.read_text())
+    except Exception:
+        meta = {}
+override = os.environ.get("PT_CTX_OVERRIDE") or ""
+by_id, by_pre, dflt = meta.get("byId") or {}, meta.get("byPrefix") or {}, meta.get("default") or {}
+def meta_for(mid):
+    if mid in by_id:
+        return by_id[mid]
+    best, bl = {}, -1
+    for k, v in by_pre.items():
+        if mid.startswith(k) and len(k) > bl:
+            best, bl = v, len(k)
+    return best or dflt
+for m in gw["models"]:
+    mid = m.get("id") or ""
+    want = int(override) if override.isdigit() else meta_for(mid).get("contextWindow")
+    cur = m.get("contextWindow")
+    if isinstance(want, int) and (not isinstance(cur, int) or cur < want or (override and cur != want)):
+        sys.exit(0)
+sys.exit(1)
+PYX
+}
+
+
+
+
+
+# 在容器里执行 python3 脚本（宿主不需要 python3；镜像内必有）
+#   host_py <挂载说明...> --  从 stdin 读脚本，环境变量经 -e 传入
+host_py(){
+  docker run --rm -i --entrypoint python3 "$@" "$IMAGE" -
+}
+
+# 资源裁剪：把"编码助手风格"的包/技能从宿主 pi-home 清掉（与镜像内 branding.sh 同策略）
+# 独立于身份同步，每次进容器前都跑（幂等、几十毫秒）
+prune_resources(){
+  local dest="$PI_HOME" pruned=0 d
+  for d in \
+      "$dest/npm/node_modules/pi-subagents/skills" \
+      "$dest/npm/node_modules/pi-subagents/prompts" \
+      "$dest/npm/node_modules/pi-mcp-adapter" ; do
+    [ -e "$d" ] && { rm -rf "$d"; pruned=$((pruned+1)); }
+  done
+  if [ "$pruned" -gt 0 ]; then
+    host_py -v "$dest:/cfg" <<'PYX' 2>/dev/null || true
+import json, pathlib
+p = pathlib.Path("/cfg/settings.json")
+if p.exists():
+    d = json.loads(p.read_text())
+    if "packages" in d:
+        d["packages"] = [x for x in d["packages"] if "mcp-adapter" not in str(x)]
+        p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+PYX
+    echo "[pt] 资源裁剪：已移除 $pruned 项（编码助手 skills/prompts 与 mcp-adapter）"
+  fi
 }
 
 # 把镜像内的 pt 身份同步到宿主 pi-home（幂等、秒级）
@@ -90,6 +204,9 @@ sync_identity(){
   [ -s "$dest/AGENTS.md" ] || need=1
   [ "$(ls -1 "$dest/skills" 2>/dev/null | wc -l)" -ge 5 ] || need=1
   [ "$(ls -1 "$dest/agents" 2>/dev/null | wc -l)" -ge 3 ] || need=1
+  # 扩展包与注册列表也必须齐备（否则容器里只有 4 个内置工具，多智能体/待办全部不可用）
+  [ -e "$dest/npm/node_modules/pi-subagents" ] || need=1
+  grep -q '"packages"' "$dest/settings.json" 2>/dev/null || need=1
   if [ "$need" = "0" ] && [ "$force" != "force" ]; then return 0; fi
   docker image inspect "$IMAGE" >/dev/null 2>&1 || { warn "镜像不存在，无法同步身份：$IMAGE"; return 1; }
   log "同步身份包：镜像 → $dest（一次性，秒级）"
@@ -105,41 +222,92 @@ sync_identity(){
   docker cp "$cid:/root/.pi/agent/extensions/roe-gate.ts" "$dest/extensions/" >/dev/null 2>&1 || true
   mkdir -p "$dest/extensions/subagent"
   docker cp "$cid:/root/.pi/agent/extensions/subagent/config.json" "$dest/extensions/subagent/" >/dev/null 2>&1 || true
+  # 扩展包：新镜像有 /opt/pt/pi-packages（种子机制，容器启动时软链）；旧镜像只能把 npm 目录捞出来（约 185MB，一次性）
+  if [ ! -e "$dest/npm/node_modules/pi-subagents" ]; then
+    if docker cp "$cid:/opt/pt/pi-packages/node_modules" "$dest/.npm-tmp" >/dev/null 2>&1; then
+      mkdir -p "$dest/npm"; mv "$dest/.npm-tmp" "$dest/npm/node_modules" 2>/dev/null || true
+      ok "扩展包已从镜像拷贝（新机制 pi-packages）"
+    elif docker cp "$cid:/root/.pi/agent/npm/node_modules" "$dest/.npm-tmp" >/dev/null 2>&1; then
+      mkdir -p "$dest/npm"; mv "$dest/.npm-tmp" "$dest/npm/node_modules" 2>/dev/null || true
+      ok "扩展包已从镜像拷贝（旧镜像 npm 目录，约 185MB）"
+    else
+      warn "扩展包拷贝失败：容器内将只有内置工具（多智能体不可用）"
+    fi
+  fi
+
+  # settings.json：把镜像侧的 packages（扩展注册清单）合并进宿主 settings，保留用户既有的模型/主题等
+  # 优先种子（新镜像）；旧镜像回退到镜像内 pi-home 的 settings.json（同样带 packages 列表）
+  if docker cp "$cid:/opt/pt/pi-home-seed/settings.json" /tmp/pt-settings-seed.json >/dev/null 2>&1 \
+     || docker cp "$cid:/root/.pi/agent/settings.json" /tmp/pt-settings-seed.json >/dev/null 2>&1; then
+    cp -f /tmp/pt-settings-seed.json "$dest/.pt-settings-seed.json" 2>/dev/null || true
+    rm -f /tmp/pt-settings-seed.json
+    host_py -v "$dest:/cfg" <<'PYX' || warn "settings.json 合并失败"
+import json, pathlib
+seed = json.loads(pathlib.Path("/cfg/.pt-settings-seed.json").read_text())
+dst = pathlib.Path("/cfg/settings.json")
+cur = json.loads(dst.read_text()) if dst.exists() else {}
+added = [k for k in seed if k not in cur]
+cur.update({k: v for k, v in seed.items() if k not in cur})
+dst.write_text(json.dumps(cur, ensure_ascii=False, indent=2))
+pathlib.Path("/cfg/.pt-settings-seed.json").unlink(missing_ok=True)
+if added:
+    print(f"[pt] settings.json 合并镜像默认项: {', '.join(added)}")
+PYX
+    rm -f /tmp/pt-settings-seed.json
+  fi
   docker rm -f "$cid" >/dev/null 2>&1 || true
-  ok "身份已就绪（技能 $(ls -1 "$dest/skills" 2>/dev/null | wc -l) · 子智能体 $(ls -1 "$dest/agents" 2>/dev/null | wc -l) · AGENTS.md $(stat -c%s "$dest/AGENTS.md" 2>/dev/null || echo 0) 字节）"
+  ok "身份已就绪（技能 $(ls -1 "$dest/skills" 2>/dev/null | wc -l) · 子智能体 $(ls -1 "$dest/agents" 2>/dev/null | wc -l) · AGENTS.md $(wc -c < "$dest/AGENTS.md" 2>/dev/null || echo 0) 字节）"
 }
 
 pick_engagement(){
   mkdir -p "$WS_ROOT"
-  if [ -n "${PT_ENG:-}" ]; then ENG="$PT_ENG"; else
-    # 只认「像交战」的目录：含 00-简报.md 或 findings.jsonl（避免把杂目录/残留当成交战）
-    mapfile -t dirs < <(cd "$WS_ROOT" 2>/dev/null && for d in */; do
+  ask_name(){   # 交互式问交战名（最多 3 次；非 TTY 直接失败并给用法）
+    local i=0 n=""
+    while :; do
+      if [ -t 0 ]; then read -rp "交战名（如 acme-2026q4，回车取消）: " n || n=""; else read -r n || n=""; fi
+      [ -n "${n:-}" ] && { printf '%s' "$(slug "$n")"; return 0; }
+      i=$((i+1))
+      if [ ! -t 0 ] || [ "$i" -ge 3 ]; then
+        die "未提供交战名（非交互环境请用 PT_ENG=<名字>，例如 PT_ENG=acme-2026q4 pt）"
+      fi
+      warn "名字不能为空，请再输一次（例如 acme-2026q4）"
+    done
+  }
+
+  if [ -n "${PT_ENG:-}" ]; then
+    ENG="$PT_ENG"
+  else
+    dirs=()
+    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(cd "$WS_ROOT" 2>/dev/null && for d in */; do
         d="${d%/}"
         [ -f "$d/00-简报.md" ] || [ -f "$d/findings.jsonl" ] || continue
         printf '%s\n' "$d"
       done)
-    if [ "${#dirs[@]}" -eq 1 ]; then ENG="${dirs[0]}"
+    if [ "${#dirs[@]}" -eq 1 ]; then
+      ENG="${dirs[0]}"
     elif [ "${#dirs[@]}" -eq 0 ]; then
-      tries=0
-      while :; do
-        if [ -t 0 ]; then read -rp "交战名（如 acme-2026q4）: " name || name=""; else read -r name || name=""; fi
-        if [ -n "${name:-}" ]; then break; fi
-        tries=$((tries+1))
-        if [ ! -t 0 ] || [ "$tries" -ge 3 ]; then
-          die "必须给交战起名（非交互环境请设 PT_ENG=<名字>，例如 PT_ENG=acme-2026q4 pt）"
-        fi
-        warn "名字不能为空，请再输一次（例如 acme-2026q4）"
-      done
-      ENG="$(slug "$name")"
+      ENG="$(ask_name)"
     else
-      echo "选择交战:"; select d in "${dirs[@]}"; do ENG="$d"; break; done
+      echo "已有交战（编号选择；直接输入新名字 = 新建交战；Ctrl-C 退出）："
+      local PS3_OLD="${PS3-}"; PS3="编号或新名字: "
+      select d in "${dirs[@]}"; do
+        if [ -n "${d:-}" ]; then ENG="$d"; break; fi
+        # 非编号输入 → 当作新交战名（旧实现里非法输入会直接跳出并报"空名"）
+        if [ -n "${REPLY:-}" ] && ! printf '%s' "$REPLY" | grep -qE '^[0-9]+$'; then
+          ENG="$(slug "$REPLY")"; break
+        fi
+        case "${REPLY:-}" in
+          "") echo "（回车 = 新建交战，请输入名字）"; ENG="$(ask_name)"; break ;;
+        esac
+        echo "无效编号，请重输；也可直接输入新交战名"
+      done
+      PS3="$PS3_OLD"
     fi
   fi
   ENG="$(slug "$ENG")"
-  # 关键防护：ENG 解析为空会把骨架直接写进 workspaces/ 根目录（实测踩过），必须拦住
-  [ -n "$ENG" ] || die "交战名无效（得到空名）——请用 PT_ENG=<名字> 指定"
+  [ -n "$ENG" ] || die "未选择交战：请重跑 pt 选择编号或输入新名字（非交互用 PT_ENG=<名字>）"
   WS="$WS_ROOT/$ENG"; mkdir -p "$WS"/{01-资产,02-证据,03-笔记,04-报告,chains,secrets,audit}
-  chmod 700 "$WS/secrets"
+  chmod 700 "$WS/secrets" 2>/dev/null || true
   [ -f "$WS/00-简报.md" ] || cat > "$WS/00-简报.md" <<EOF
 # $ENG
 
@@ -152,6 +320,7 @@ pick_engagement(){
 EOF
   [ -f "$WS/findings.jsonl" ] || : > "$WS/findings.jsonl"
 }
+
 
 container_name(){ printf 'pt-%s' "$1"; }
 
@@ -186,13 +355,15 @@ docker_args(){
 }
 
 cmd_run(){
-  need_docker; sync_identity; ensure_models_json; sync_settings_model; pick_engagement
+  need_docker; sync_identity; prune_resources; ensure_models_json; sync_settings_model; pick_engagement
   local cname; cname="$(container_name "$ENG")"
   # 默认把 config.env 里的模型/思考档传给 pi（否则 pi 用自带默认模型，与配置不符 —— 实测踩过）
   # 用户显式给了 --model / --thinking 则不覆盖
   pi_args=()
   case " $* " in *" --model "*) ;; *) [ -n "${PT_MODEL:-}" ] && pi_args+=(--model "$PT_MODEL") ;; esac
   case " $* " in *" --thinking "*) ;; *) [ -n "${PT_THINKING:-}" ] && pi_args+=(--thinking "$PT_THINKING") ;; esac
+  # 会话名：让状态行常驻显示"PT Agent · 交战 <名>"（pi 头部会渲染在工作区旁边）
+  case " $* " in *" --name "*|*" -n "*) ;; *) pi_args+=(--name "PT Agent · 交战 $ENG") ;; esac
   if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
     log "接入已运行的交战容器 $cname"
     shift || true
@@ -217,7 +388,7 @@ cmd_init(){
        sed -i '/^#\? *DEEPSEEK_API_KEY=/d' "$CONFIG"; echo "DEEPSEEK_API_KEY=$k" >> "$CONFIG";;
     2) read -rp "provider 名（anthropic/openai/...）: " p; read -rsp "API KEY: " k; echo
        sed -i '/^#\? *PT_PROVIDER=/d' "$CONFIG"; echo "PT_PROVIDER=$p" >> "$CONFIG"
-       echo "${p^^}_API_KEY=$k" >> "$CONFIG";;
+       echo "$(printf '%s' "$p" | tr '[:lower:]' '[:upper:]')_API_KEY=$k" >> "$CONFIG";;
     3) # baseURL 规范化：允许只填主机名或带尾斜杠，自动补 /v1
        read -rp "网关 baseURL（…/v1；默认 ${PT_BASE_URL:-http://127.0.0.1:8000/v1}）: " u
        u="${u:-${PT_BASE_URL:-}}"
@@ -234,7 +405,7 @@ cmd_init(){
   chmod 600 "$CONFIG"
   ok "已写入 $CONFIG"
 
-  # ── 关键：pi 只从 ~/.pi/agent/models.json 解析 provider/model ──────────────
+  # ── 关键：pi 只从 agent 目录下的 models.json 解析 provider/model（容器内 /root/.pi/agent/models.json）
   # （pi v0.85 没有 --base-url/--api-key 这些开关；早前自检用它们 → 必然假失败）
   if [ "${PT_PROVIDER:-gateway}" = "gateway" ] && [ -n "${PT_BASE_URL:-}" ]; then
     log "同步模型清单到 pi-home/models.json"
@@ -259,53 +430,111 @@ cmd_init(){
 # 从网关联表 /v1/models 生成 pi 的 models.json（保留其它 provider；先备份）
 sync_gateway_models(){
   local base="${PT_BASE_URL%/}" key="${PT_API_KEY:-}" tmp ids
-  tmp="$(mktemp)"
-  ids="$(curl -sS -m 15 -H "Authorization: Bearer ${key}" "${base}/models" 2>/dev/null \
-        | python3 -c 'import json,sys
-try: d=json.load(sys.stdin)
-except Exception: sys.exit(1)
-print("\n".join(m.get("id","") for m in (d.get("data") or d.get("models") or []) if m.get("id")))' 2>/dev/null)" || true
-  [ -n "$ids" ] || { warn "网关未返回模型清单（${base}/models）"; return 1; }
-  PT_IDS="$ids" PT_BASE="$base" PT_KEY="$key" PI_JSON="$PI_HOME/models.json" python3 - <<'PYEOF'
-import json, os, pathlib
-ids = [x for x in os.environ["PT_IDS"].splitlines() if x.strip()]
-path = pathlib.Path(os.environ["PI_JSON"])
+  [ -n "$base" ] && [ -n "$key" ] || { warn "缺少 PT_BASE_URL/PT_API_KEY"; return 1; }
+  ensure_model_metadata     # 元数据表（上下文长度）先就位，否则生成出来的模型没有上下文档位
+  # 元数据表：用户可编辑的 $PI_HOME/model-metadata.json 优先，其次镜像内身份包那份
+  if [ ! -f "$PI_HOME/model-metadata.json" ] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    local cid; cid="$(docker create "$IMAGE")" || return 1
+    docker cp "$cid:/opt/pt/identity/model-metadata.json" "$PI_HOME/model-metadata.json" >/dev/null 2>&1 || true
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+  fi
+  # 全部在容器内完成：拉网关联表 + 生成 models.json（宿主不需要 python/curl 造 JSON）
+  host_py -v "$PI_HOME:/cfg" -e "PT_BASE=$base" -e "PT_KEY=$key" -e "PT_CTX_OVERRIDE=${PT_CONTEXT_WINDOW:-}" <<'PYEOF'
+import json, os, pathlib, urllib.request
+
+base, key = os.environ["PT_BASE"], os.environ["PT_KEY"]
+req = urllib.request.Request(base + "/models", headers={"Authorization": "Bearer " + key})
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode())
+except Exception as e:
+    print(f"[pt] 拉取模型清单失败：{type(e).__name__}: {str(e)[:80]}")
+    raise SystemExit(1)
+ids = [m.get("id") for m in (data.get("data") or data.get("models") or []) if m.get("id")]
+if not ids:
+    print("[pt] 网关未返回模型清单")
+    raise SystemExit(1)
+
+path = pathlib.Path("/cfg/models.json")
 old = json.loads(path.read_text()) if path.is_file() else {"providers": {}}
 if path.is_file():
     pathlib.Path(str(path) + ".bak").write_text(json.dumps(old, ensure_ascii=False, indent=1))
-cw = int(os.environ.get("PT_CONTEXT_WINDOW", "262144"))
-think = {"off": None, "minimal": None, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
+
+meta = {}
+mp = pathlib.Path("/cfg/model-metadata.json")
+if mp.is_file():
+    try:
+        meta = json.loads(mp.read_text())
+    except Exception:
+        meta = {}
+by_id, by_pre, dflt = meta.get("byId") or {}, meta.get("byPrefix") or {}, meta.get("default") or {}
+def meta_for(mid):
+    if mid in by_id:
+        return by_id[mid]
+    best, bl = {}, -1
+    for k, v in by_pre.items():
+        if mid.startswith(k) and len(k) > bl:
+            best, bl = v, len(k)
+    return best or dflt
+override = os.environ.get("PT_CTX_OVERRIDE") or ""
+override = int(override) if override.isdigit() else None
+
+think = {"off": None, "minimal": None, "low": "low", "medium": "medium",
+         "high": "high", "xhigh": "xhigh", "max": "max"}
 old_models = {m.get("id"): m for m in old.get("providers", {}).get("gateway", {}).get("models", [])}
-models = []
+models, notes = [], []
 for i in ids:
-    m = dict(old_models.get(i) or {"id": i, "name": i, "contextWindow": cw, "reasoning": True})
+    prev = dict(old_models.get(i) or {})
+    m = prev or {"id": i, "name": i, "reasoning": True, "thinkingLevelMap": think}
+    m.setdefault("id", i); m.setdefault("name", i); m.setdefault("reasoning", True)
     m.setdefault("thinkingLevelMap", think)
+    want = override
+    if want is None:
+        cand = meta_for(i).get("contextWindow")
+        cur = m.get("contextWindow")
+        if isinstance(cand, int) and (not isinstance(cur, int) or cur < cand):
+            want = cand
+            if isinstance(cur, int):
+                notes.append(f"{i}: {cur} → {cand}（按元数据表上调）")
+    if want and want != m.get("contextWindow"):
+        m["contextWindow"] = want
+    cand_out = meta_for(i).get("maxOutput")
+    if isinstance(cand_out, int) and not isinstance(m.get("maxOutput"), int):
+        m["maxOutput"] = cand_out
     models.append(m)
-# 注意字段名：pi 读的是 "api"（不是 "type"）——写错会报
-#   Provider "gateway": ... no "api" specified  → 模型全部不可见（实测踩过）
+
 old.setdefault("providers", {})["gateway"] = {
-    "baseUrl": os.environ["PT_BASE"],
-    "apiKey": os.environ["PT_KEY"],
-    "api": "openai-completions",
-    "models": models,
+    "baseUrl": base, "apiKey": key, "api": "openai-completions", "models": models,
 }
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps(old, ensure_ascii=False, indent=1))
-path.chmod(0o600)
-print(f"[pt] models.json: gateway {len(models)} 个模型（{', '.join(ids[:4])}…）")
+try:
+    path.chmod(0o600)
+except OSError:
+    pass
+ctx = sorted({m.get("contextWindow") for m in models if isinstance(m.get("contextWindow"), int)})
+print(f"[pt] models.json: gateway {len(models)} 个模型 · 上下文档位 {ctx}")
+for n in notes[:6]:
+    print(f"       {n}")
 PYEOF
 }
 cmd_doctor(){
-  need_docker; sync_identity || true; ensure_models_json || true; local bad=0
+  need_docker; sync_identity || true; prune_resources || true; ensure_models_json || true; local bad=0
   chk(){ local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else warn "$n 失败"; bad=$((bad+1)); fi; }
   chk "docker daemon" docker info
   chk "镜像 $IMAGE" docker image inspect "$IMAGE"
-  chk "config.env 权限 600" bash -c "[ \"\$(stat -c %a '$CONFIG')\" = 600 ]"
+  chk "config.env 权限 600" bash -c "find '$CONFIG' -maxdepth 0 -perm 600 | grep -q ."
   chk "pi 运行时" docker run --rm --env-file "$CONFIG" "$IMAGE" pi --version
   # 身份要查"内容"而不是"存在"（曾出现宿主空文件假通过）
   chk "身份 AGENTS.md（非空）" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c "test -s /root/.pi/agent/AGENTS.md"
   chk "身份 技能 ≥5" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c "[ \$(ls -1 /root/.pi/agent/skills 2>/dev/null | wc -l) -ge 5 ]"
   chk "身份 子智能体 ≥3" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c "[ \$(ls -1 /root/.pi/agent/agents 2>/dev/null | wc -l) -ge 3 ]"
+  # 先过一次入口（物化身份/扩展包），再校验扩展能力 —— 这是"多智能体是否真的可用"的判据
+  docker run --rm -v "$PI_HOME:/root/.pi/agent" "$IMAGE" pi --version >/dev/null 2>&1 || true
+  chk "扩展能力（子智能体/待办 包）" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" \
+      -c "test -e /root/.pi/agent/npm/node_modules/pi-subagents && test -e /root/.pi/agent/npm/node_modules/@juicesharp/rpiv-todo"
+  chk "扩展注册（settings.packages）" docker run --rm --entrypoint bash -v "$PI_HOME:/root/.pi/agent" "$IMAGE" \
+      -c "python3 -c \"import json;d=json.load(open('/root/.pi/agent/settings.json'));assert d.get('packages'),'packages 为空'\""
   chk "工具链（nmap/httpx/ffuf）" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" \
       -c 'command -v nmap httpx ffuf sqlmap agent-browser >/dev/null'
   chk "字典包" docker run --rm --entrypoint bash --env-file "$CONFIG" "$IMAGE" -c "test -f /opt/pt/dicts/pt-dir-common.txt"
@@ -364,7 +593,7 @@ cmd_export_learnings(){ pick_engagement
   docker run --rm --entrypoint bash -v "$WS:/work" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c '
     set -e
     out="/work/04-报告/learnings-$(date +%Y%m%d).md"
-    { echo "# 本地经验导出（脱敏）"; echo; echo "生成时间: $(date -Iseconds)"; echo
+    { echo "# 本地经验导出（脱敏）"; echo; echo "生成时间: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo
       echo "## 本地经验层"; for f in /root/.pi/agent/skills/kb-local/*.md; do [ -f "$f" ] && { echo "### $(basename "$f")"; cat "$f"; echo; }; done
       echo "## 复盘"; for f in /work/04-报告/复盘.md; do [ -f "$f" ] && cat "$f"; done
     } > "$out"
@@ -390,6 +619,19 @@ case "${1:-}" in
   snapshot) shift; cmd_snapshot "$@" ;;
   fix-perms) shift; cmd_fixperms ;;
   export-learnings) shift; cmd_export_learnings ;;
+  models) shift
+    need_docker; sync_settings_model
+    log "刷新模型清单（从网关拉取 + 应用 model-metadata.json）"
+    sync_gateway_models || die "模型清单同步失败"
+    sync_settings_model
+    host_py -v "$PI_HOME:/cfg" <<'PYX' 2>/dev/null || true
+import json
+gw = json.load(open("/cfg/models.json"))["providers"]["gateway"]
+print(f"  网关 {gw['baseUrl']} · {len(gw['models'])} 个模型")
+for m in gw["models"]:
+    print(f"    {m['id']:26} 上下文 {m.get('contextWindow')}")
+PYX
+    echo "  提示：上下文长度在 $PI_HOME/model-metadata.json 里调整（网关不暴露该元数据），改完再跑 pt models" ;;
   selftest) shift; cmd_selftest "$@" ;;
   mcp) shift
     case "${1:-}" in

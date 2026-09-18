@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-PT_VERSION_DEFAULT="v0.1.0"   # 发布 tag 带 v 前缀（另有 latest）
+PT_VERSION_DEFAULT="v0.2.0"   # 发布 tag 带 v 前缀（另有 latest）
 PT_DIR="${PT_DIR:-$HOME/.pentest-agent}"
 PT_IMAGE_REGISTRY="${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}"
 PT_OFFLINE_TAR=""
@@ -26,7 +26,7 @@ usage() {
 用法: install.sh [选项]
 
   --dir <path>        运行时目录（默认 ~/.pentest-agent）
-  --version <ver>     镜像版本（默认 v0.1.0）
+  --version <ver>     镜像版本（默认 v0.2.0）
   --registry <host>   镜像仓库前缀（默认 ghcr.io/xxxe88）
   --local-image <tag> 使用本地已有的镜像 tag，不拉取
   --docker-proxy <url> 让 Docker 守护进程走代理（拉 ghcr.io 超时/慢时用；重启 dockerd）
@@ -55,7 +55,7 @@ mkdir -p "$PT_DIR"
 LOG="$PT_DIR/install.log"
 exec > >(tee -a "$LOG") 2>&1
 
-log "PT Agent 安装器 · $(date -Iseconds)"
+log "PT Agent 安装器 · $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 log "运行时目录: $PT_DIR"
 
 # ── 1. 前置检查 ─────────────────────────────────────────
@@ -118,7 +118,7 @@ if [ -f "$CONFIG" ]; then
 else
   cat > "$CONFIG" <<EOF
 # PT Agent 配置（chmod 600；密钥只存这里，永不进镜像）
-# 生成于 $(date -Iseconds)
+# 生成于 $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # ── 运行资源（安装时探测：宿主内存/CPU 的 60%）──
 PT_MEM=${MEM_MB}m
@@ -139,18 +139,47 @@ configure_docker_proxy(){
   fi
   mkdir -p /etc/docker
   [ -f "$cfg" ] && cp -a "$cfg" "$cfg.bak-$(date +%Y%m%d%H%M%S)"
-  PT_PROXY_URL="$url" PT_CFG="$cfg" python3 - <<'PYX' || { warn "写 $cfg 失败"; return 1; }
-import json, os, pathlib
-cfg = pathlib.Path(os.environ["PT_CFG"])
-d = json.loads(cfg.read_text()) if cfg.exists() else {}
-d["proxies"] = {
-    "http-proxy": os.environ["PT_PROXY_URL"],
-    "https-proxy": os.environ["PT_PROXY_URL"],
-    "no-proxy": "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal",
-}
-cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+  local no_proxy_list="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal"
+  # 写 daemon.json：优先 jq，其次宿主 python3；都没有就用 sed 处理"我们产生的已知结构"（不引入硬依赖）
+  PT_CFG="$cfg" PT_PROXY_URL="$url" PT_NO_PROXY_LIST="$no_proxy_list" bash <<'EOS'
+set -e
+cfg="$PT_CFG"
+merged=""
+if command -v jq >/dev/null 2>&1; then
+  merged=$(jq --arg u "$PT_PROXY_URL" --arg np "$PT_NO_PROXY_LIST" \
+    '. + {proxies:{"http-proxy":$u,"https-proxy":$u,"no-proxy":$np}}' "$cfg" 2>/dev/null) || merged=""
+fi
+if [ -z "$merged" ] && command -v python3 >/dev/null 2>&1; then
+  merged=$(python3 - "$cfg" "$PT_PROXY_URL" "$PT_NO_PROXY_LIST" <<'PYX'
+import json, sys
+cfg, url, noproxy = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(cfg)) if cfg else {}
+d["proxies"] = {"http-proxy": url, "https-proxy": url, "no-proxy": noproxy}
+print(json.dumps(d, indent=2, ensure_ascii=False))
 PYX
-  if service docker restart >/dev/null 2>&1; then :; else pkill -x dockerd 2>/dev/null; sleep 4; nohup dockerd >/tmp/dockerd.log 2>&1 & fi
+) || merged=""
+fi
+if [ -z "$merged" ]; then
+  # 无 jq / python3：保留已有的 registry-mirrors 与 log-* 段，重建一份已知结构的文件
+  mirrors=$(awk '/"registry-mirrors"/,/]/' "$cfg" 2>/dev/null || true)
+  logopts=$(awk '/"log-opts"/,/[}]/' "$cfg" 2>/dev/null || true)
+  {
+    echo "{"
+    [ -n "$mirrors" ] && { echo "$mirrors" | sed '1s/^/  /'; echo ","; }
+    [ -n "$logopts" ] && { echo "$logopts" | sed '1s/^/  /'; echo ","; }
+    cat <<JSON
+  "proxies": {
+    "http-proxy": "$PT_PROXY_URL",
+    "https-proxy": "$PT_PROXY_URL",
+    "no-proxy": "$PT_NO_PROXY_LIST"
+  }
+}
+JSON
+  } > "$cfg.new" && mv "$cfg.new" "$cfg"
+else
+  printf '%s\n' "$merged" > "$cfg"
+fi
+EOS  if service docker restart >/dev/null 2>&1; then :; else pkill -x dockerd 2>/dev/null; sleep 4; nohup dockerd >/tmp/dockerd.log 2>&1 & fi
   for _ in $(seq 1 20); do docker info >/dev/null 2>&1 && break; sleep 2; done
   docker info 2>/dev/null | grep -qi "HTTP Proxy" && ok "守护进程代理已生效（容器需重启后恢复）" || warn "代理似乎未生效，可检查 $cfg 与 /tmp/dockerd.log"
 }
