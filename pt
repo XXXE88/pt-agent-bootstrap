@@ -205,7 +205,9 @@ sync_identity(){
   [ "$(ls -1 "$dest/skills" 2>/dev/null | wc -l)" -ge 5 ] || need=1
   [ "$(ls -1 "$dest/agents" 2>/dev/null | wc -l)" -ge 3 ] || need=1
   # 扩展包与注册列表也必须齐备（否则容器里只有 4 个内置工具，多智能体/待办全部不可用）
-  [ -e "$dest/npm/node_modules/pi-subagents" ] || need=1
+  # 新镜像：pi-home/npm 是指向容器内种子 /opt/pt/pi-packages 的符号链接（宿主侧看是断链，属正常）
+  # 旧镜像：真实目录（那时才需要把 npm 目录拷到宿主，约 185MB）
+  if [ -L "$dest/npm" ]; then :; else [ -e "$dest/npm/node_modules/pi-subagents" ] || need=1; fi
   grep -q '"packages"' "$dest/settings.json" 2>/dev/null || need=1
   if [ "$need" = "0" ] && [ "$force" != "force" ]; then return 0; fi
   docker image inspect "$IMAGE" >/dev/null 2>&1 || { warn "镜像不存在，无法同步身份：$IMAGE"; return 1; }
@@ -223,13 +225,14 @@ sync_identity(){
   mkdir -p "$dest/extensions/subagent"
   docker cp "$cid:/root/.pi/agent/extensions/subagent/config.json" "$dest/extensions/subagent/" >/dev/null 2>&1 || true
   # 扩展包：新镜像有 /opt/pt/pi-packages（种子机制，容器启动时软链）；旧镜像只能把 npm 目录捞出来（约 185MB，一次性）
-  if [ ! -e "$dest/npm/node_modules/pi-subagents" ]; then
-    if docker cp "$cid:/opt/pt/pi-packages/node_modules" "$dest/.npm-tmp" >/dev/null 2>&1; then
-      mkdir -p "$dest/npm"; mv "$dest/.npm-tmp" "$dest/npm/node_modules" 2>/dev/null || true
-      ok "扩展包已从镜像拷贝（新机制 pi-packages）"
+  if [ ! -e "$dest/npm/node_modules/pi-subagents" ] && [ ! -L "$dest/npm" ]; then
+    if docker image inspect "$IMAGE" >/dev/null 2>&1 && \
+       docker run --rm --entrypoint bash "$IMAGE" -lc 'test -d /opt/pt/pi-packages/node_modules' >/dev/null 2>&1; then
+      # 新机制：镜像内种子 + 容器启动时软链，宿主不需要落一份（省 185MB）
+      ok "扩展包由镜像内种子提供（容器启动时物化软链，宿主不占空间）"
     elif docker cp "$cid:/root/.pi/agent/npm/node_modules" "$dest/.npm-tmp" >/dev/null 2>&1; then
       mkdir -p "$dest/npm"; mv "$dest/.npm-tmp" "$dest/npm/node_modules" 2>/dev/null || true
-      ok "扩展包已从镜像拷贝（旧镜像 npm 目录，约 185MB）"
+      ok "扩展包已从镜像拷贝（旧镜像，无种子机制，约 185MB）"
     else
       warn "扩展包拷贝失败：容器内将只有内置工具（多智能体不可用）"
     fi

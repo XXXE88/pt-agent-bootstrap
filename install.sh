@@ -150,6 +150,7 @@ if command -v jq >/dev/null 2>&1; then
     '. + {proxies:{"http-proxy":$u,"https-proxy":$u,"no-proxy":$np}}' "$cfg" 2>/dev/null) || merged=""
 fi
 if [ -z "$merged" ] && command -v python3 >/dev/null 2>&1; then
+  # pt-gate: allow-host-python3 —— 机会性加速（宿主有 python3 才用），无则走下面 sed 兜底
   merged=$(python3 - "$cfg" "$PT_PROXY_URL" "$PT_NO_PROXY_LIST" <<'PYX'
 import json, sys
 cfg, url, noproxy = sys.argv[1], sys.argv[2], sys.argv[3]
