@@ -3,8 +3,12 @@
 #   pt                进入当前交战容器（无则新建）
 #   pt init           配置模型与密钥 + 连通性自检
 #   pt models         刷新模型清单
-#   pt doctor         十一项自检
+#   pt doctor         环境与能力自检（含扩展能力/注册）
 #   pt update         更新镜像与身份包
+#   pt ls             列出交战（带日期/目标/发现数/交付状态）
+#   --eng <名>        指定交战（可放任意位置；管理命令默认用最近活跃的那个，且不会新建）
+#   pt rm <名>        归档交战（移到 .archive/，可恢复；不硬删）
+#   pt rename <旧> <新>  重命名交战（容器一并改名）
 #   pt down           停止并删除交战容器（保留工作区）
 #   pt clean          删除工作区（二次确认）；--purge 连容器一起
 #   pt capture on|off mitmproxy 流量存档开关
@@ -22,7 +26,7 @@ CONFIG="$PT_HOME/config.env"
 [ -f "$CONFIG" ] || { echo "未找到 $CONFIG —— 先运行 installer/install.sh" >&2; exit 1; }
 set -a; . "$CONFIG"; set +a
 
-IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.2.0}}"   # 发布 tag 由 PT_IMAGE_TAG 覆盖（默认 v0.2.0，另有 latest）
+IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.2.1}}"   # 发布 tag 由 PT_IMAGE_TAG 覆盖（默认 v0.2.1，另有 latest）
 WS_ROOT="$PT_HOME/workspaces"
 PI_HOME="$PT_HOME/pi-home"
 NETWORK="${PT_NETWORK:-host}"
@@ -43,10 +47,31 @@ slug(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/
 # 把用户选的模型写进 pi 的 settings.json：
 #   · subagents.defaultModel（身份包里硬编码的 deepseek-v4-flash 必须跟随用户配置）
 #   · 顶层 model（pi 的默认模型，未显式 --model 时生效）
+# 镜像是否已品牌化（piConfig.name=pt-agent）？结果按镜像 ID 缓存，避免每次 pt 都探测
+#   品牌化镜像 → 显示启动头部（内容已经是 PT Agent 的）；旧镜像 → 藏掉头部（避免露出 pi 字样）
+image_is_branded(){
+  local iid; iid="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)" || return 1
+  [ -n "$iid" ] || return 1
+  local cache="$PT_HOME/.branded-image-id"
+  [ -f "$cache" ] && [ "$(cat "$cache" 2>/dev/null)" = "$iid" ] && return 0
+  if docker run --rm -i --entrypoint python3 "$IMAGE" - >/dev/null 2>&1 <<'PYP'
+import json, sys
+p = "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/package.json"
+sys.exit(0 if json.load(open(p)).get("piConfig", {}).get("name") == "pt-agent" else 1)
+PYP
+  then
+    printf '%s' "$iid" > "$cache" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$cache" 2>/dev/null || true
+  return 1
+}
+
 sync_settings_model(){
   [ -n "${PT_MODEL:-}" ] || return 0
   docker image inspect "$IMAGE" >/dev/null 2>&1 || return 0
-  host_py -v "$PI_HOME:/cfg" -e "PT_MODEL_NAME=${PT_MODEL}" <<'PYX' || { warn "settings.json 同步失败"; return 1; }
+  host_py -v "$PI_HOME:/cfg" -e "PT_MODEL_NAME=${PT_MODEL}" \
+      -e "PT_QUIET=$(image_is_branded && echo false || echo true)" <<'PYX' || { warn "settings.json 同步失败"; return 1; }
 import json, os, pathlib
 p = pathlib.Path("/cfg/settings.json")
 d = json.loads(p.read_text()) if p.exists() else {}
@@ -57,9 +82,10 @@ if d.get("model") != model:
 sub = d.setdefault("subagents", {})
 if sub.get("defaultModel") != model:
     sub["defaultModel"] = model; changed.append("subagents.defaultModel")
-# UI 品牌项：隐藏 pi 自带的启动头（品牌名/自述文案在镜像侧改名，这里是即时生效的开关）
-if d.get("quietStartup") is not True:
-    d["quietStartup"] = True; changed.append("quietStartup")
+# UI 品牌项：是否隐藏启动头部由镜像是否已品牌化决定（品牌化镜像显示头部，内容即 PT Agent 的）
+want_quiet = os.environ.get("PT_QUIET", "false") == "true"
+if d.get("quietStartup") is not want_quiet:
+    d["quietStartup"] = want_quiet; changed.append("quietStartup")
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
 print("[pt] settings.json 模型已同步: " + (", ".join(changed) if changed else "已是最新"))
@@ -172,6 +198,28 @@ host_py(){
 
 # 资源裁剪：把"编码助手风格"的包/技能从宿主 pi-home 清掉（与镜像内 branding.sh 同策略）
 # 独立于身份同步，每次进容器前都跑（幂等、几十毫秒）
+# pi-fff 状态自愈：缺配置就补；把"同名目录挡住 sqlite 文件"的坑挪开
+#   实测踩过：早期失败运行留下 fff/frecency.db 是一个**目录** → SQLite 打不开 → 每次启动报错
+ensure_fff_state(){
+  local d="$PI_HOME/fff" ts
+  mkdir -p "$d" 2>/dev/null || return 0
+  if [ ! -f "$PI_HOME/pi-fff.json" ]; then
+    cat > "$PI_HOME/pi-fff.json" <<'JSON'
+{
+  "frecencyDbPath": "/root/.pi/agent/fff/frecency.db",
+  "historyDbPath": "/root/.pi/agent/fff/history.db",
+  "enableHomeDirScanning": false
+}
+JSON
+  fi
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  for f in frecency.db history.db; do
+    if [ -d "$d/$f" ]; then
+      mv "$d/$f" "$d/.$f.dir-bak-$ts" 2>/dev/null && warn "已修正 fff 状态：$f 是目录（挡住了数据库文件），已移到 .$f.dir-bak-$ts"
+    fi
+  done
+}
+
 prune_resources(){
   local dest="$PI_HOME" pruned=0 d
   for d in \
@@ -214,11 +262,23 @@ sync_identity(){
   log "同步身份包：镜像 → $dest（一次性，秒级）"
   local cid; cid="$(docker create "$IMAGE")" || return 1
   mkdir -p "$dest"
+  # 注意：skills/ 下含**用户本地经验层 kb-local/**（agent 打完一场沉淀的手册，会随 pi-home 持久）。
+  # 同步时必须保留，否则等于删掉用户资产（曾踩过：整目录替换导致 kb-local 丢失，靠会话记录才找回）。
+  kb_tmp=""
+  if [ -d "$dest/skills/kb-local" ]; then
+    kb_tmp="$(mktemp -d)"; cp -a "$dest/skills/kb-local" "$kb_tmp/" 2>/dev/null || true
+  fi
   for item in AGENTS.md skills agents; do
     docker rm -f "$cid" >/dev/null 2>&1
     cid="$(docker create "$IMAGE")"
     docker cp "$cid:/root/.pi/agent/$item" "$dest/" >/dev/null 2>&1 || warn "  缺失：$item"
   done
+  if [ -n "$kb_tmp" ] && [ -d "$kb_tmp/kb-local" ]; then
+    mkdir -p "$dest/skills"
+    cp -a "$kb_tmp/kb-local/." "$dest/skills/kb-local/" 2>/dev/null || true
+    rm -rf "$kb_tmp"
+    [ -d "$dest/skills/kb-local" ] && ok "  已保留本地经验层 kb-local/（$(ls -1 "$dest/skills/kb-local" | wc -l) 项）"
+  fi
   # 扩展（roe-gate 闸门 + subagent 配置）只补缺，不覆盖宿主已有扩展
   mkdir -p "$dest/extensions"
   docker cp "$cid:/root/.pi/agent/extensions/roe-gate.ts" "$dest/extensions/" >/dev/null 2>&1 || true
@@ -262,6 +322,119 @@ PYX
   ok "身份已就绪（技能 $(ls -1 "$dest/skills" 2>/dev/null | wc -l) · 子智能体 $(ls -1 "$dest/agents" 2>/dev/null | wc -l) · AGENTS.md $(wc -c < "$dest/AGENTS.md" 2>/dev/null || echo 0) 字节）"
 }
 
+# ── 交战元数据（全部取自工作区里现成的文件，不引入新状态）──────────────
+eng_meta(){   # $1 = 交战名 → "日期|目标|发现数|交付|空?"（所有字段保证单行）
+  local name="$1" dir="$WS_ROOT/$1" brief="$WS_ROOT/$1/00-简报.md"
+  local when="—" target="" findings=0 report=0 empty="" ts
+  ts="$(date -u -r "$dir" +%s 2>/dev/null || true)"
+  if [ -n "$ts" ]; then
+    when="$(date -u -d "@$ts" +%Y-%m-%d 2>/dev/null || date -u -r "$ts" +%Y-%m-%d 2>/dev/null || echo "—")"
+  fi
+  if [ -f "$brief" ]; then
+    # 目标：优先从"范围"行取 URL（纯 ASCII，中文不会被截断成乱码）
+    target="$(grep -m1 -E '范围' "$brief" 2>/dev/null | grep -oE 'https?://[^ )），,`]+' | head -1 || true)"
+    if [ -z "$target" ]; then
+      target="$(grep -m1 -oE 'https?://[^ )），,`]+' "$brief" 2>/dev/null || true)"
+    fi
+    if [ -z "$target" ]; then
+      # 没有 URL：只保留 ASCII 字符集（避免中文被按字节截断），且必须像主机/路径，否则视为无
+      local cand
+      cand="$(grep -m1 -E '范围' "$brief" 2>/dev/null | sed 's/^[^：]*：//' | tr -cd '[:alnum:]./:_-' | cut -c1-30 || true)"
+      case "$cand" in
+        *.*|*/*|*:*) target="$cand";;
+      esac
+    fi
+    if [ -z "$target" ]; then target="—"; fi
+  else
+    target="—"
+  fi
+  if [ -f "$dir/findings.jsonl" ]; then
+    findings="$(awk 'END{print NR+0}' "$dir/findings.jsonl" 2>/dev/null || true)"
+  fi
+  case "$findings" in ''|*[!0-9]*) findings=0;; esac
+  local f
+  for f in "$dir"/04-报告/*.md; do
+    [ -f "$f" ] || continue
+    case "$f" in *复盘*) continue;; esac
+    report=$((report+1))
+  done
+  if [ "$findings" -eq 0 ] && [ "$report" -eq 0 ]; then empty="空"; fi
+  local deliver="—"
+  if [ "$report" -gt 0 ]; then deliver="已交付"; fi
+  if [ -n "$empty" ]; then deliver="空"; fi
+  printf '%s|%s|%s|%s|%s\n' "$when" "$target" "$findings" "$deliver" "$empty"
+}
+
+eng_dirs(){   # 活跃交战，非空在前、按最近活动倒序、空交战排最后；跳过隐藏目录（含 .archive）
+  local out d ts flag
+  out="$(cd "$WS_ROOT" 2>/dev/null && for d in */; do
+      d="${d%/}"
+      case "$d" in .*) continue;; esac
+      [ -f "$d/00-简报.md" ] || [ -f "$d/findings.jsonl" ] || continue
+      printf '%s\n' "$d"
+    done)"
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out" | while IFS= read -r d; do
+    ts="$(date -u -r "$WS_ROOT/$d" +%s 2>/dev/null || echo 0)"
+    flag=0
+    if [ "$(eng_meta "$d" | cut -d'|' -f5)" = "空" ]; then flag=1; fi
+    printf '%s\t%s\t%s\n' "$flag" "$ts" "$d"
+  done | sort -k1,1n -k2,2rn | cut -f3
+}
+
+eng_table(){
+  local i=0 d meta
+  printf '  %-4s %-26s %-11s %-32s %-5s %-6s\n' "编号" "交战名" "最近活动" "目标" "发现" "交付"
+  printf '  %s\n' "----------------------------------------------------------------------------------------------------------"
+  for d in $(eng_dirs); do
+    i=$((i+1))
+    meta="$(eng_meta "$d")"
+    local nm="$d"
+    printf '  %-4s %-26s %-11s %-32s %-5s %-6s\n' "$i)" "$nm" \
+      "$(printf '%s' "$meta" | cut -d'|' -f1)" \
+      "$(printf '%s' "$meta" | cut -d'|' -f2 | cut -c1-32)" \
+      "$(printf '%s' "$meta" | cut -d'|' -f3)" \
+      "$(printf '%s' "$meta" | cut -d'|' -f4)"
+  done
+}
+
+eng_similar(){  # $1 = 新名 → 最相近的已有交战（前缀互相包含，或共同前缀 ≥4）
+  local new="$1" d best="" blen=0
+  for d in $(eng_dirs); do
+    case "$d" in "$new"*) printf '%s' "$d"; return 0;; esac
+    case "$new" in "$d"*) printf '%s' "$d"; return 0;; esac
+  done
+  for d in $(eng_dirs); do
+    local i=0 l=0 len=${#d} ca cb
+    [ "${#new}" -lt "$len" ] && len=${#new}
+    while [ "$i" -lt "$len" ]; do
+      ca="$(printf '%s' "$new" | cut -c$((i+1)))"
+      cb="$(printf '%s' "$d" | cut -c$((i+1)))"
+      [ "$ca" = "$cb" ] || break
+      i=$((i+1)); l=$i
+    done
+    if [ "$l" -ge 4 ] && [ "$l" -gt "$blen" ]; then best="$d"; blen="$l"; fi
+  done
+  if [ -n "$best" ]; then printf '%s' "$best"; fi
+  return 0
+}
+
+# 管理命令用：解析交战（**不交互、不新建**）—— PT_ENG / --eng <名> / 最近活跃的那个
+resolve_eng(){
+  local name="${PT_ENG:-}" d
+  if [ -n "$name" ]; then
+    name="$(slug "$name")"
+    [ -d "$WS_ROOT/$name" ] || die "没有这个交战：$name（pt ls 查看；管理命令不会新建交战）"
+    ENG="$name"
+  else
+    d="$(eng_dirs | head -1)"
+    [ -n "$d" ] || die "还没有任何交战：先运行 pt 建一个（管理命令不会新建交战）"
+    ENG="$d"
+    log "使用最近活跃的交战：$ENG（要指定别的用 --eng <名>；pt ls 查看全部）"
+  fi
+  WS="$WS_ROOT/$ENG"
+}
+
 pick_engagement(){
   mkdir -p "$WS_ROOT"
   ask_name(){   # 交互式问交战名（最多 3 次；非 TTY 直接失败并给用法）
@@ -281,28 +454,43 @@ pick_engagement(){
     ENG="$PT_ENG"
   else
     dirs=()
-    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(cd "$WS_ROOT" 2>/dev/null && for d in */; do
-        d="${d%/}"
-        [ -f "$d/00-简报.md" ] || [ -f "$d/findings.jsonl" ] || continue
-        printf '%s\n' "$d"
-      done)
+    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(eng_dirs)
     if [ "${#dirs[@]}" -eq 1 ]; then
       ENG="${dirs[0]}"
+      ok "进入已有交战：$ENG"
     elif [ "${#dirs[@]}" -eq 0 ]; then
       ENG="$(ask_name)"
     else
-      echo "已有交战（编号选择；直接输入新名字 = 新建交战；Ctrl-C 退出）："
-      local PS3_OLD="${PS3-}"; PS3="编号或新名字: "
+      [ -t 0 ] || die "有多个交战，非交互环境请指定：PT_ENG=<名字> pt（用 pt ls 查看）"
+      echo "已有交战："
+      eng_table
+      echo "  · 编号仅**本次会话**有效；稳定标识是交战名本身（写进文档/脚本请用名字）"
+      echo "  · 输入编号=进入 · 输入新名字=新建（会先确认） · 回车=新建 · Ctrl-C=退出"
+      local PS3_OLD="${PS3-}"; PS3="编号或名字: "
       select d in "${dirs[@]}"; do
         if [ -n "${d:-}" ]; then ENG="$d"; break; fi
-        # 非编号输入 → 当作新交战名（旧实现里非法输入会直接跳出并报"空名"）
+        # 非编号输入 → 新交战名：先确认 + 近似提示（挡住 ttt → tttt 这类笔误）
         if [ -n "${REPLY:-}" ] && ! printf '%s' "$REPLY" | grep -qE '^[0-9]+$'; then
-          ENG="$(slug "$REPLY")"; break
+          local cand near ans; cand="$(slug "$REPLY")"
+          if [ -z "$cand" ]; then echo "  名字无效（给个有意义的名字，如 acme-2026q4）"; continue; fi
+          near="$(eng_similar "$cand")"
+          if [ -n "$near" ]; then
+            echo "  ⚠ 「$cand」不在列表中，但与已有的「$near」很接近。"
+            printf '  要进入「%s」吗？[Y/n] ' "$near"
+            read -r ans || ans=""
+            case "${ans:-y}" in ""|y|Y) ENG="$near"; break;; esac
+          fi
+          printf '  确认新建交战「%s」？[y/N] ' "$cand"
+          read -r ans || ans=""
+          case "${ans:-n}" in
+            y|Y) ENG="$cand"; break;;
+            *) echo "  （已取消：输编号选已有，或换一个名字）"; continue;;
+          esac
         fi
         case "${REPLY:-}" in
           "") echo "（回车 = 新建交战，请输入名字）"; ENG="$(ask_name)"; break ;;
         esac
-        echo "无效编号，请重输；也可直接输入新交战名"
+        echo "无效编号：请输编号或新名字（pt ls 可看全部）"
       done
       PS3="$PS3_OLD"
     fi
@@ -358,7 +546,7 @@ docker_args(){
 }
 
 cmd_run(){
-  need_docker; sync_identity; prune_resources; ensure_models_json; sync_settings_model; pick_engagement
+  need_docker; sync_identity; prune_resources; ensure_fff_state; ensure_models_json; sync_settings_model; pick_engagement
   local cname; cname="$(container_name "$ENG")"
   # 默认把 config.env 里的模型/思考档传给 pi（否则 pi 用自带默认模型，与配置不符 —— 实测踩过）
   # 用户显式给了 --model / --thinking 则不覆盖
@@ -370,6 +558,8 @@ cmd_run(){
   if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
     log "接入已运行的交战容器 $cname"
     shift || true
+    # 进入前再校正一次托管键（防镜像内种子合并把宿主设置写回；对旧镜像尤其必要）
+    sync_settings_model || true
     docker exec -it -w /work "$cname" pi ${pi_args[@]+"${pi_args[@]}"} "$@"
   else
     log "启动交战容器 $cname（$IMAGE）· 网络 $NETWORK · ${MEM}/${CPUS}cpu"
@@ -378,6 +568,49 @@ cmd_run(){
   fi
 }
 
+
+cmd_ls(){   # 列出交战（带元数据；不启容器）
+  mkdir -p "$WS_ROOT"
+  if [ -z "$(eng_dirs)" ]; then
+    echo "还没有交战：运行 pt 新建（或 PT_ENG=<名字> pt）。"
+    return 0
+  fi
+  echo "已有交战："
+  eng_table
+  echo "  · 编号仅当次交互有效；稳定标识是交战名（写文档/脚本请用名字）"
+  echo "  · 进入：pt · 管理：pt rename <旧> <新> · pt rm <名>（归档到 .archive/，不硬删）"
+}
+
+cmd_rename(){   # pt rename <旧> <新>
+  [ $# -ge 2 ] || die "用法: pt rename <旧名> <新名>"
+  local old new
+  old="$(slug "$1")"; new="$(slug "$2")"
+  [ -n "$old" ] && [ -n "$new" ] || die "名字无效"
+  [ -d "$WS_ROOT/$old" ] || die "没有这个交战：$old"
+  [ -e "$WS_ROOT/$new" ] && die "已存在同名交战：$new"
+  mv "$WS_ROOT/$old" "$WS_ROOT/$new" || die "重命名失败"
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "pt-$old"; then
+    docker rename "pt-$old" "pt-$new" >/dev/null 2>&1 && ok "容器已一并改名（pt-$old → pt-$new）"
+  fi
+  ok "已重命名：$old → $new"
+}
+
+cmd_rm(){   # pt rm <名>：归档进 .archive/（不硬删，可 mv 回去恢复）
+  if [ $# -lt 1 ]; then
+    echo "已有交战："; eng_table; die "用法: pt rm <名>（归档，不硬删）"
+  fi
+  local name ts ans
+  name="$(slug "$1")"
+  [ -d "$WS_ROOT/$name" ] || die "没有这个交战：$name"
+  printf '确认归档交战「%s」？工作区会移到 .archive/（可恢复）[y/N] ' "$name"
+  read -r ans || ans=""
+  case "${ans:-n}" in y|Y) ;; *) die "已取消" ;; esac
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  mkdir -p "$WS_ROOT/.archive"
+  mv "$WS_ROOT/$name" "$WS_ROOT/.archive/$name-$ts" || die "归档失败"
+  docker rm -f "pt-$name" >/dev/null 2>&1 && ok "交战容器已移除" || true
+  ok "已归档：.archive/$name-$ts（恢复：mv 回 workspaces/ 即可）"
+}
 
 cmd_init(){
   need_docker
@@ -522,7 +755,7 @@ for n in notes[:6]:
 PYEOF
 }
 cmd_doctor(){
-  need_docker; sync_identity || true; prune_resources || true; ensure_models_json || true; local bad=0
+  need_docker; sync_identity || true; prune_resources || true; ensure_fff_state || true; ensure_models_json || true; sync_settings_model || true; local bad=0
   chk(){ local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else warn "$n 失败"; bad=$((bad+1)); fi; }
   chk "docker daemon" docker info
   chk "镜像 $IMAGE" docker image inspect "$IMAGE"
@@ -556,17 +789,17 @@ cmd_update(){
   ok "更新完成（镜像 tag 可用 PT_IMAGE 指定）"
 }
 
-cmd_down(){ need_docker; pick_engagement
+cmd_down(){ need_docker; resolve_eng
   docker rm -f "$(container_name "$ENG")" >/dev/null 2>&1 && ok "容器已删除（工作区保留：$WS）" || log "容器未在运行"; }
 
-cmd_clean(){ need_docker; pick_engagement
+cmd_clean(){ need_docker; resolve_eng
   warn "将删除整个工作区：$WS"
   read -rp "输入交战名确认删除: " c; [ "$c" = "$ENG" ] || die "已取消"
   docker rm -f "$(container_name "$ENG")" >/dev/null 2>&1 || true
   rm -rf "$WS"; ok "工作区已删除" ; }
 
-cmd_capture(){ need_docker; pick_engagement
-  case "${1:-}" in
+cmd_capture(){ need_docker; resolve_eng
+case "${1:-}" in
     on)  log "在容器内启动 mitmproxy 存档（写入 /work/02-证据/_flows）"
          docker run -d --name "$(container_name "$ENG")-mitm" --network host \
            --entrypoint bash -v "$WS:/work" "$IMAGE" \
@@ -576,21 +809,21 @@ cmd_capture(){ need_docker; pick_engagement
     *) die "用法: pt capture on|off";;
   esac; }
 
-cmd_install(){ need_docker; pick_engagement
+cmd_install(){ need_docker; resolve_eng
   [ $# -ge 1 ] || die "用法: pt install <pkg>"
   docker run --rm --entrypoint bash -v "$WS:/work" "$IMAGE" \
     -c "mkdir -p /work/.toolbox/bin && uv pip install --target /work/.toolbox/py '$1' || pip3 install --target /work/.toolbox/py '$1'"
   ok "已装到工作区工具箱（容器内 PATH 已前置 /work/.toolbox/bin）"; }
 
-cmd_snapshot(){ need_docker; pick_engagement
+cmd_snapshot(){ need_docker; resolve_eng
   [ $# -ge 1 ] || die "用法: pt snapshot <tag>"
   docker commit "$(container_name "$ENG")" "$1" >/dev/null && ok "已提交为镜像 $1"; }
 
-cmd_fixperms(){ pick_engagement
+cmd_fixperms(){ resolve_eng
   docker run --rm --entrypoint chown -v "$WS_ROOT:/ws" "$IMAGE" -R "${UID:-1000}:${GID:-1000}" "/ws/$ENG" 2>/dev/null \
     && ok "属主已改为 ${UID:-1000}:${GID:-1000}" || warn "修正失败（容器未运行时会跳过）"; }
 
-cmd_export_learnings(){ pick_engagement
+cmd_export_learnings(){ resolve_eng
   local out="$WS/04-报告/learnings-$(date +%Y%m%d).md"
   log "从 kb-local 与复盘生成脱敏经验导出 → $out"
   docker run --rm --entrypoint bash -v "$WS:/work" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" -c '
@@ -609,6 +842,17 @@ cmd_selftest(){ need_docker
   else
     warn "靶场自检脚本尚未就绪（M3 交付）：ranges/selftest.sh"
   fi; }
+
+# --eng <名> 可在任意位置出现：统一摘出（管理命令与 pt run 都认）
+_pt_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --eng|--engagement) PT_ENG="${2:-}"; export PT_ENG; shift 2 2>/dev/null || shift;;
+    --eng=*|--engagement=*) PT_ENG="${1#*=}"; export PT_ENG; shift;;
+    *) _pt_args+=("$1"); shift;;
+  esac
+done
+if [ "${#_pt_args[@]}" -gt 0 ]; then set -- "${_pt_args[@]}"; else set --; fi
 
 case "${1:-}" in
   "") cmd_run ;;
@@ -649,6 +893,9 @@ PYX
         esac;;
       *) die "用法：pt mcp [list|add]";;
     esac ;;
+  ls|list) cmd_ls ;;
+  rename) shift; cmd_rename "$@" ;;
+  rm|archive) shift; cmd_rm "$@" ;;
   resume) shift; cmd_run --continue ;;
   run) shift; cmd_run "$@" ;;
   help|-h|--help) sed -n '2,20p' "$0";;
