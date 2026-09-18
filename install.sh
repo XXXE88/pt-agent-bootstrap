@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-PT_VERSION_DEFAULT="v0.2.1"   # 发布 tag 带 v 前缀（另有 latest）
+PT_VERSION_DEFAULT="v0.2.2"   # 发布 tag 带 v 前缀（另有 latest）
 PT_DIR="${PT_DIR:-$HOME/.pentest-agent}"
 PT_IMAGE_REGISTRY="${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}"
 PT_OFFLINE_TAR=""
@@ -26,7 +26,7 @@ usage() {
 用法: install.sh [选项]
 
   --dir <path>        运行时目录（默认 ~/.pentest-agent）
-  --version <ver>     镜像版本（默认 v0.2.1）
+  --version <ver>     镜像版本（默认 v0.2.2）
   --registry <host>   镜像仓库前缀（默认 ghcr.io/xxxe88）
   --local-image <tag> 使用本地已有的镜像 tag，不拉取
   --docker-proxy <url> 让 Docker 守护进程走代理（拉 ghcr.io 超时/慢时用；重启 dockerd）

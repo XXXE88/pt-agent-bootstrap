@@ -21,7 +21,7 @@ Windows 建议 ssh 到一台 Linux 用（本机无需虚拟化），或走 WSL2 
 ## 这是什么
 
 PT Agent = Web/API 深挖型渗透测试智能体（Docker 沙箱 + 身份包 + 5 个子智能体 + L3 高危动作确认闸）。
-镜像 `ghcr.io/xxxe88/pt-agent`（当前 v0.2.1；默认 private，安装时用 `PT_GHCR_TOKEN=<PAT>` 拉取）。
+镜像 `ghcr.io/xxxe88/pt-agent`（当前 v0.2.2；默认 private，安装时用 `PT_GHCR_TOKEN=<PAT>` 拉取）。
 另有离线包：Release 里的 `pt-agent-v<版本>.tar.zst`（`install.sh --offline` 可直接加载）。
 
 ## 授权声明

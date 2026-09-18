@@ -11,7 +11,7 @@
 #   pt rename <旧> <新>  重命名交战（容器一并改名）
 #   pt down           停止并删除交战容器（保留工作区）
 #   pt clean          删除工作区（二次确认）；--purge 连容器一起
-#   pt capture on|off mitmproxy 流量存档开关
+#   pt capture on|off|status  mitmproxy 流量存档（默认 8080；PT_MITM_PORT 换端口）
 #   pt install <pkg>  在工作区工具箱安装工具（随工作区走）
 #   pt snapshot <tag> 把当前容器提交为派生镜像
 #   pt selftest       靶场冒烟 + 评分（M3）
@@ -26,7 +26,7 @@ CONFIG="$PT_HOME/config.env"
 [ -f "$CONFIG" ] || { echo "未找到 $CONFIG —— 先运行 installer/install.sh" >&2; exit 1; }
 set -a; . "$CONFIG"; set +a
 
-IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.2.1}}"   # 发布 tag 由 PT_IMAGE_TAG 覆盖（默认 v0.2.1，另有 latest）
+IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.2.2}}"   # 发布 tag 由 PT_IMAGE_TAG 覆盖（默认 v0.2.2，另有 latest）
 WS_ROOT="$PT_HOME/workspaces"
 PI_HOME="$PT_HOME/pi-home"
 NETWORK="${PT_NETWORK:-host}"
@@ -515,8 +515,51 @@ EOF
 
 container_name(){ printf 'pt-%s' "$1"; }
 
+# 流量存档（mitmproxy）生效时，给容器注入代理与 CA —— 让沙箱内所有工具**自动**经存档，
+# 不需要用户/agent 记得加 -x（曾写成"你自己把流量导过去"，那是半成品）
+mitm_env_args(){   # $1 = 交战工作区 → 输出 docker run 的 -e 参数（无存档时输出空）
+  local ws="$1" pf="$ws/.mitm-port" ca="$ws/.mitm-ca.pem" bundle="$ws/.mitm-ca-bundle.pem"
+  [ -f "$pf" ] || return 0
+  local port mname
+  port="$(cat "$pf" 2>/dev/null || true)"
+  [ -n "$port" ] || return 0
+  mname="$(container_name "$ENG")-mitm"
+  docker ps --format '{{.Names}}' | grep -qx "$mname" || return 0     # 存档没在跑就不注入
+  local gw
+  if [ "$NETWORK" = "host" ]; then
+    gw="127.0.0.1"                       # 交战容器与存档容器共用宿主 netns
+  else
+    gw="$(docker network inspect pt-net -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+    [ -n "$gw" ] || gw="172.17.0.1"
+  fi
+  # NO_PROXY：本机/网关 + **模型网关主机**（别截获 agent 自己的 LLM 流量：既防密钥进证据，也避免被代理故障拖死）
+  local nop="localhost,127.0.0.1,$gw" gwhost
+  gwhost="$(printf '%s' "${PT_BASE_URL:-}" | sed 's|^[a-zA-Z]*://||; s|/.*$||; s|:.*$||')"
+  [ -n "$gwhost" ] && nop="$nop,$gwhost"
+  printf '%s\n' \
+    -e "HTTP_PROXY=http://$gw:$port" -e "HTTPS_PROXY=http://$gw:$port" \
+    -e "http_proxy=http://$gw:$port" -e "https_proxy=http://$gw:$port" \
+    -e "NO_PROXY=$nop" -e "no_proxy=$nop"
+  # 信任链：优先用**合并包**（系统根证书 + mitm CA）——SSL_CERT_FILE 是替换语义，
+  # 只给 mitm CA 会让"绕过代理的 HTTPS"全部校验失败
+  local cafile="/work/.mitm-ca.pem"
+  [ -f "$bundle" ] && cafile="/work/.mitm-ca-bundle.pem"
+  if [ -f "$ca" ]; then
+    printf '%s\n' -e "SSL_CERT_FILE=$cafile" -e "REQUESTS_CA_BUNDLE=$cafile" \
+      -e "CURL_CA_BUNDLE=$cafile" -e "NODE_EXTRA_CA_CERTS=$cafile" -e "GIT_SSL_CAINFO=$cafile"
+  fi
+}
+
+# bridge 模式需要 pt-net 网络：不存在就建（否则 docker run --network pt-net 会因 network not found 失败）
+ensure_network(){
+  [ "$NETWORK" = "host" ] && return 0
+  docker network inspect pt-net >/dev/null 2>&1 || docker network create pt-net >/dev/null 2>&1 || true
+}
+
 docker_args(){
   local ws="$1"
+  # 流量存档透明代理（未开启时为空）
+  MITM_EXTRA="$(mitm_env_args "$ws" | tr '\n' ' ')"
   printf '%s\n' \
     --rm -it \
     --name "$(container_name "$ENG")" \
@@ -527,6 +570,7 @@ docker_args(){
     --env-file "$CONFIG" \
     -e "PT_ENG=$ENG" \
     -e "TZ=${TZ:-Asia/Shanghai}" \
+    ${MITM_EXTRA:-} \
     --memory "$MEM" --cpus "$CPUS" --pids-limit "$PIDS"
   # 能力：CAPS 是逗号分隔（如 NET_RAW,NET_ADMIN）→ docker 需要**逐个** --cap-add
   # （曾整串传入导致 `invalid CapAdd: unknown capability: "CAP_NET_RAW,CAP_NET_ADMIN"`）
@@ -546,7 +590,7 @@ docker_args(){
 }
 
 cmd_run(){
-  need_docker; sync_identity; prune_resources; ensure_fff_state; ensure_models_json; sync_settings_model; pick_engagement
+  need_docker; sync_identity; prune_resources; ensure_fff_state; ensure_models_json; sync_settings_model; pick_engagement; ensure_network
   local cname; cname="$(container_name "$ENG")"
   # 默认把 config.env 里的模型/思考档传给 pi（否则 pi 用自带默认模型，与配置不符 —— 实测踩过）
   # 用户显式给了 --model / --thinking 则不覆盖
@@ -799,14 +843,54 @@ cmd_clean(){ need_docker; resolve_eng
   rm -rf "$WS"; ok "工作区已删除" ; }
 
 cmd_capture(){ need_docker; resolve_eng
-case "${1:-}" in
-    on)  log "在容器内启动 mitmproxy 存档（写入 /work/02-证据/_flows）"
-         docker run -d --name "$(container_name "$ENG")-mitm" --network host \
-           --entrypoint bash -v "$WS:/work" "$IMAGE" \
-           -c 'mkdir -p /work/02-证据/_flows && mitmdump -q -w /work/02-证据/_flows/flow-$(date +%s).flows' >/dev/null
-         ok "已开启";;
-    off) docker rm -f "$(container_name "$ENG")-mitm" >/dev/null 2>&1 && ok "已关闭" || true;;
-    *) die "用法: pt capture on|off";;
+  local cname; cname="$(container_name "$ENG")-mitm"
+  local portfile="$WS/.mitm-port"
+  case "${1:-status}" in
+    on)
+      local flowtag; flowtag="$(date -u +%Y%m%dT%H%M%SZ)"; local base="${PT_MITM_PORT:-8080}" port="" p i ok=0
+      log "在容器内启动 mitmproxy 流量存档（写入 /work/02-证据/_flows）"
+      # 端口自动避让：默认 8080 起，被占就往后试（宿主机上 8080 常被别的服务占着）
+      for i in 0 1 2 3 4 5 6 7 8 9; do
+        p=$((base + i))
+        # 幂等：同名容器先清掉（含"已停止但仍占着名字"的情况 —— 直接 docker run 会撞名报错）
+        docker rm -f "$cname" >/dev/null 2>&1 || true
+        docker run -d --name "$cname" --network host \
+          --entrypoint bash -v "$WS:/work" "$IMAGE" \
+          -c "mkdir -p '/work/02-证据/_flows' && exec mitmdump -q --listen-port $p -w '/work/02-证据/_flows/flow-$flowtag.flows'" >/dev/null
+        # 真检查：等它稳定，并确认端口真的在监听（曾只 sleep 2 就报成功 → 假阳性）
+        sleep 4
+        if docker ps --format '{{.Names}}' | grep -qx "$cname" \
+           && docker exec "$cname" python3 -c "import socket;socket.create_connection(('127.0.0.1',$p),2)" >/dev/null 2>&1; then
+          port="$p"; ok=1; break
+        fi
+      done
+      if [ "$ok" = "1" ]; then
+        printf '%s\n' "$port" > "$portfile" 2>/dev/null || true
+        docker cp "$cname:/root/.mitmproxy/mitmproxy-ca-cert.pem" "$WS/.mitm-ca.pem" >/dev/null 2>&1 || true
+        # 合并信任包 = 系统根证书 + mitm CA（避免"只信 mitm CA"导致绕过代理的 HTTPS 全失败）
+        docker exec "$cname" bash -lc 'cat /etc/ssl/certs/ca-certificates.crt /root/.mitmproxy/mitmproxy-ca-cert.pem > /work/.mitm-ca-bundle.pem 2>/dev/null' >/dev/null 2>&1 || true
+        ok "已开启（端口 $port；停止：pt capture off）"
+        log "容器内已自动走该存档（HTTP(S)_PROXY + CA 已注入），你不需要手动加 -x"
+        [ -f "$WS/.mitm-ca.pem" ] && log "CA 已导出到工作区：.mitm-ca.pem（手工/外部工具需在容器外用时可取它）"
+        [ "$port" != "$base" ] && warn "默认端口 $base 被占，已自动改用 $port"
+      else
+        warn "mitmproxy 起不来 —— 实际原因（末尾日志）："
+        docker logs --tail 12 "$cname" 2>&1 | sed 's/^/    /'
+        warn "本次尝试的端口范围：$base-$((base + 9))"
+      fi ;;
+    off)
+      if docker rm -f "$cname" >/dev/null 2>&1; then ok "已关闭"; else ok "本就没开启"; fi
+      rm -f "$portfile" "$WS/.mitm-ca.pem" "$WS/.mitm-ca-bundle.pem" 2>/dev/null || true
+      echo "  提示：**已在运行的**交战容器仍带着代理环境变量，退出重进才会去掉。" ;;
+    ""|status)
+      if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
+        local up; up="$(cat "$portfile" 2>/dev/null || echo "?")"
+        ok "运行中：$cname（端口 $up）"
+        echo "  容器内新版会话会自动走该存档（HTTP(S)_PROXY + CA 注入）；已运行的旧会话需退出重进。"
+      else
+        echo "未开启（pt capture on 开启；端口默认 8080，被占会自动往后找）"
+      fi ;;
+    *) die "用法: pt capture [on|off|status]" ;;
   esac; }
 
 cmd_install(){ need_docker; resolve_eng
