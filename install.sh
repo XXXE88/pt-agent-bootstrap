@@ -85,11 +85,23 @@ fi
 
 command -v curl >/dev/null || die "缺少 curl"
 if ! command -v docker >/dev/null; then
+  if [ "$IS_WSL" = 1 ]; then
+    die "WSL 里还没装 docker（Windows 上不需要 Docker Desktop）。一条命令修好：
+  → curl -fsSL https://raw.githubusercontent.com/XXXE88/pt-agent-bootstrap/main/wsl-docker-fix.sh | sudo bash
+  → 然后重跑本安装命令（详见 docs/WINDOWS.md）"
+  fi
   die "未检测到 docker。
-  → 请先安装 Docker（Linux: apt install docker.io 或官方脚本；Windows: Docker Desktop + WSL2）
-  → 或改用裸机方案: pi install <identity>（工具不全，仅方法论可用）"
+  → Linux: apt install docker.io 或官方脚本（https://get.docker.com）
+  → Windows: 推荐 WSL2 内装 docker 引擎（不用 Docker Desktop），或 ssh 到一台 Linux 用（详见 docs/WINDOWS.md）"
 fi
-docker info >/dev/null 2>&1 || die "docker 已安装但 daemon 不可用（检查服务是否启动 / 当前用户是否在 docker 组）"
+if ! docker info >/dev/null 2>&1; then
+  if [ "$IS_WSL" = 1 ]; then
+    die "docker daemon 不可用。WSL 重启后 dockerd 常常没起来，一条命令修好：
+  → curl -fsSL https://raw.githubusercontent.com/XXXE88/pt-agent-bootstrap/main/wsl-docker-fix.sh | sudo bash
+  → 想开机自启：printf '[boot]\\nsystemd=true\\n' | sudo tee /etc/wsl.conf，然后 PowerShell 里 wsl --shutdown"
+  fi
+  die "docker 已安装但 daemon 不可用（检查服务是否启动 / 当前用户是否在 docker 组）"
+fi
 
 AVAIL_KB=$(df -Pk "$PT_DIR" | awk 'NR==2{print $4}')
 if [ "${AVAIL_KB:-0}" -lt 8388608 ]; then

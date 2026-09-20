@@ -50,7 +50,7 @@ PT_IMAGE=crpi-bp9jv9s9c4qx3e17.cn-hangzhou.personal.cr.aliyuncs.com/pentest_imag
 |---|---|
 | Linux / WSL2 | 完整体验（host 网络：SYN 扫描、内网横向都可用） |
 | macOS | 可用，但仅 bridge 网络（SYN 扫描与内网目标不可达） |
-| Windows | 建议 ssh 到一台 Linux 使用；或 WSL2 + Docker Desktop |
+| **Windows** | ① 本机 WSL2（**不需要 Docker Desktop**）：`wsl --install -d Ubuntu` → 跑 `wsl-docker-fix.sh` → 装本产品<br>② 零安装：ssh 到一台 Linux 用（Windows 自带 ssh 客户端）<br>详见 [docs/WINDOWS.md](https://github.com/XXXE88/pt-agent/blob/main/docs/WINDOWS.md) |
 
 ## 文件
 
@@ -58,5 +58,6 @@ PT_IMAGE=crpi-bp9jv9s9c4qx3e17.cn-hangzhou.personal.cr.aliyuncs.com/pentest_imag
 |---|---|
 | `install.sh` | 安装器（幂等）：环境检查 → 拉镜像 → 装 `pt` → 引导 `pt init` |
 | `pt` | 启动器：`init / doctor / update / ls / rename / rm / capture / tools / snapshot / selftest / export-learnings` |
+| `wsl-docker-fix.sh` | WSL2 里把 Docker 引擎修到可用（不装 Docker Desktop；幂等） |
 
 > 这两个文件由主仓库 `installer/` 同步生成（`bash installer/sync-bootstrap.sh --push`），请勿直接在此修改。
