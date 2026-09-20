@@ -625,7 +625,7 @@ docker_args(){
 }
 
 cmd_run(){
-  need_docker; sync_identity; prune_resources; ensure_fff_state; ensure_models_json; sync_settings_model; pick_engagement; ensure_network; cleanup_stale_capture
+  need_docker; ensure_image; sync_identity; prune_resources; ensure_fff_state; ensure_models_json; sync_settings_model; pick_engagement; ensure_network; cleanup_stale_capture
   local cname; cname="$(container_name "$ENG")"
   # 默认把 config.env 里的模型/思考档传给 pi（否则 pi 用自带默认模型，与配置不符 —— 实测踩过）
   # 用户显式给了 --model / --thinking 则不覆盖
@@ -650,7 +650,7 @@ cmd_run(){
 
 cmd_tools(){   # 全量工具清单（在镜像里跑自检脚本，85 项）—— 权威清单，不靠人工列举
   need_docker; resolve_eng
-  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "镜像不存在：$IMAGE（先 pt update）"
+  ensure_image
   log "全量工具自检（镜像 $IMAGE；在容器内跑 /opt/pt/tools/99-verify.sh）"
   if [ -f /opt/pt/tools/99-verify.sh ]; then :; fi
   docker run --rm --entrypoint bash "$IMAGE" -lc 'bash /opt/pt/tools/99-verify.sh 2>&1' > /tmp/pt-tools-$$.log 2>&1 || true
@@ -877,11 +877,63 @@ cmd_doctor(){
   if [ "$bad" -eq 0 ]; then ok "全部通过"; else warn "$bad 项异常"; fi
 }
 
+# 拉取镜像并对失败原因给出可照做的指引（凭据过期/仓库不存在/网络不通/需要国内源）
+# 只依赖 docker + POSIX 工具（宿主侧约束）
+pull_image(){   # $1 = 镜像引用；返回 0 成功
+  local img="$1" out rc reg
+  out="$(docker pull "$img" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$out" | tail -1
+    return 0
+  fi
+  printf '%s\n' "$out" | tail -4 >&2
+  reg="${img%%/*}"
+  case "$out" in
+    *"unauthorized"*|*"denied"*|*"authentication required"*|*"401"*|*"403"*)
+      warn "这是仓库凭据问题（凭据常会过期）。按需选其一："
+      echo "   · 重新登录：  docker login $reg"
+      echo "   · 改用国内仓库：PT_IMAGE_REGISTRY=<ACR 前缀> pt update"
+      echo "   · 若镜像是公开的，可先退出登录再试：docker logout $reg"
+      ;;
+    *"manifest unknown"*|*"not found"*|*"no such manifest"*)
+      warn "仓库里没有这个 tag：$img"
+      echo "   · 确认版本：PT_UPDATE_VERSION=v0.2.3 pt update"
+      echo "   · 或指定完整镜像：PT_IMAGE=<完整镜像:tag> pt update"
+      ;;
+    *"no such host"*|*"timeout"*|*"TLS"*|*"connection"*|*"i/o timeout"*|*"failed to do request"*|*"EOF"*|*"proxyconnect"*|*"context deadline"*)
+      warn "网络不可达：$img"
+      echo "   · 国内建议用 ACR：PT_IMAGE_REGISTRY=crpi-bp9jv9s9c4qx3e17.cn-hangzhou.personal.cr.aliyuncs.com/pentest_images pt update"
+      echo "   · 或用离线包：pt install --offline <包文件>"
+      ;;
+    *)
+      warn "镜像拉取失败：$img（原因见上方输出）"
+      ;;
+  esac
+  return 1
+}
+
+# 镜像缺失时先尝试拉取（新机器/镜像被清掉后仍能一条命令起步），失败则给可照做的指引
+ensure_image(){
+  docker image inspect "$IMAGE" >/dev/null 2>&1 && return 0
+  warn "本地没有镜像：$IMAGE —— 现在尝试拉取（首次约数 GB）"
+  pull_image "$IMAGE" && { ok "镜像已就绪"; return 0; }
+  die "镜像不可用：$IMAGE"
+}
+
 cmd_update(){
   sync_identity force
   need_docker
   log "拉取最新镜像"
-  docker pull "${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_UPDATE_VERSION:-latest}" || warn "镜像更新失败（可继续）"
+  _want="${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_UPDATE_VERSION:-latest}"
+  if pull_image "$_want"; then
+    ok "已拉取 $_want"
+  elif docker image inspect "$_want" >/dev/null 2>&1; then
+    warn "拉取未成功，但本地已有该镜像，继续使用本地副本"
+  elif docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    warn "拉取未成功，继续使用当前镜像：$IMAGE"
+  else
+    die "拉取失败且本地没有可用镜像"
+  fi
   log "容器内更新身份包与扩展"
   docker run --rm --entrypoint bash --env-file "$CONFIG" -v "$PI_HOME:/root/.pi/agent" "$IMAGE" \
     -c 'pi update --extensions || true'

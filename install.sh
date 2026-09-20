@@ -245,13 +245,15 @@ if [ -n "${PT_GHCR_TOKEN:-}" ]; then
     && echo "[ok] 已登录 ghcr.io" || echo "[!] ghcr.io 登录失败（镜像若为 public 可忽略）"
 fi
     if ! docker pull "$PT_IMAGE"; then
-      die "镜像拉取失败。可选：
-  → 【拉取超时/慢】让守护进程走宿主代理：bash install.sh --docker-proxy "${http_proxy:-http://<宿主IP>:7890}"
+      die "镜像拉取失败。按提示选一条：
+  → 【国内推荐·最快】直接用阿里云 ACR（公开仓库，可匿名拉取）：
+       PT_IMAGE_REGISTRY=crpi-bp9jv9s9c4qx3e17.cn-hangzhou.personal.cr.aliyuncs.com/pentest_images \
+         bash install.sh
+  → 【凭据过期】多半是登录过期（GHCR 常见）：docker logout ghcr.io 后重试，或 docker login ghcr.io
   → 【私有包】带上自己的 GitHub PAT：PT_GHCR_TOKEN=<token> PT_GHCR_USER=<用户名> bash install.sh
-  → 或把包设为 public（GitHub → Packages → pt-agent → Package settings → Change visibility）
-  → 国内加速：配置 docker 镜像加速后重试（见 README）
-  → 使用离线包: bash install.sh --offline pt-agent-v0.1.0.tar.zst
-  → 如果镜像已在本机: bash install.sh --local-image <tag>"
+  → 【拉取超时/慢】让守护进程走宿主代理：bash install.sh --docker-proxy "${http_proxy:-http://<宿主IP>:7890}"
+  → 【网络不通】用离线包：bash install.sh --offline pt-agent-v0.2.3.tar.zst
+  → 【镜像已在本机】bash install.sh --local-image <tag>"
     fi
     ok "镜像已就绪"
   fi
