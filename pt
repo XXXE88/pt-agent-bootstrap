@@ -6,6 +6,8 @@
 #   pt doctor         环境与能力自检（含扩展能力/注册）
 #   pt update         更新镜像与身份包
 #   pt ls             列出交战（带日期/目标/发现数/交付状态）
+#   pt tools [--list] 全量工具自检（镜像内 85 项权威清单）
+#   PT_SANDBOX_PROXY=http://host:port  让沙箱走出口代理（**默认不走**：沙箱直连目标）
 #   --eng <名>        指定交战（可放任意位置；管理命令默认用最近活跃的那个，且不会新建）
 #   pt rm <名>        归档交战（移到 .archive/，可恢复；不硬删）
 #   pt rename <旧> <新>  重命名交战（容器一并改名）
@@ -26,7 +28,7 @@ CONFIG="$PT_HOME/config.env"
 [ -f "$CONFIG" ] || { echo "未找到 $CONFIG —— 先运行 installer/install.sh" >&2; exit 1; }
 set -a; . "$CONFIG"; set +a
 
-IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.2.2}}"   # 发布 tag 由 PT_IMAGE_TAG 覆盖（默认 v0.2.2，另有 latest）
+IMAGE="${PT_IMAGE:-${PT_IMAGE_REGISTRY:-ghcr.io/xxxe88}/pt-agent:${PT_IMAGE_TAG:-v0.2.3}}"   # 发布 tag 由 PT_IMAGE_TAG 覆盖（默认 v0.2.3，另有 latest）
 WS_ROOT="$PT_HOME/workspaces"
 PI_HOME="$PT_HOME/pi-home"
 NETWORK="${PT_NETWORK:-host}"
@@ -198,6 +200,26 @@ host_py(){
 
 # 资源裁剪：把"编码助手风格"的包/技能从宿主 pi-home 清掉（与镜像内 branding.sh 同策略）
 # 独立于身份同步，每次进容器前都跑（幂等、几十毫秒）
+# 陈旧存档状态：标记存在但 mitm 没在跑 → 清掉（否则新容器会被注入一个死代理，网络全断）
+cleanup_stale_capture(){
+  # 扫**所有**交战（不只是当前那个）：标记存在但 mitm 未运行 → 清掉标记
+  # （否则新容器会被注入一个死代理，网络全断 —— 实测踩过）
+  local d pf mname n=0
+  mkdir -p "$WS_ROOT" 2>/dev/null || true
+  for d in $(eng_dirs); do
+    pf="$WS_ROOT/$d/.mitm-port"
+    [ -f "$pf" ] || continue
+    mname="$(container_name "$d")-mitm"
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$mname"; then
+      rm -f "$pf" 2>/dev/null || true
+      n=$((n+1))
+    fi
+  done
+  if [ "$n" -gt 0 ]; then
+    warn "清理了 $n 处陈旧流量存档状态（标记存在但 mitm 未运行）；若某运行中的会话仍带 HTTP_PROXY 变量，退出重进即可"
+  fi
+}
+
 # pi-fff 状态自愈：缺配置就补；把"同名目录挡住 sqlite 文件"的坑挪开
 #   实测踩过：早期失败运行留下 fff/frecency.db 是一个**目录** → SQLite 打不开 → 每次启动报错
 ensure_fff_state(){
@@ -533,7 +555,8 @@ mitm_env_args(){   # $1 = 交战工作区 → 输出 docker run 的 -e 参数（
     [ -n "$gw" ] || gw="172.17.0.1"
   fi
   # NO_PROXY：本机/网关 + **模型网关主机**（别截获 agent 自己的 LLM 流量：既防密钥进证据，也避免被代理故障拖死）
-  local nop="localhost,127.0.0.1,$gw" gwhost
+  local nop="localhost,127.0.0.1" gwhost
+  [ "$gw" != "127.0.0.1" ] && nop="$nop,$gw"
   gwhost="$(printf '%s' "${PT_BASE_URL:-}" | sed 's|^[a-zA-Z]*://||; s|/.*$||; s|:.*$||')"
   [ -n "$gwhost" ] && nop="$nop,$gwhost"
   printf '%s\n' \
@@ -560,6 +583,8 @@ docker_args(){
   local ws="$1"
   # 流量存档透明代理（未开启时为空）
   MITM_EXTRA="$(mitm_env_args "$ws" | tr '\n' ' ')"
+  # 沙箱**默认不走任何代理**：下面先清空所有来源（config.env / 宿主 shell）的代理变量，
+  # 只有流量存档注入或显式开关（PT_SANDBOX_PROXY）才会设置 —— 目标流量不该悄悄绕到宿主代理上。
   printf '%s\n' \
     --rm -it \
     --name "$(container_name "$ENG")" \
@@ -568,6 +593,7 @@ docker_args(){
     -v "$ws:/work" \
     -v "$PI_HOME:/root/.pi/agent" \
     --env-file "$CONFIG" \
+    -e NO_PROXY= -e no_proxy= \
     -e "PT_ENG=$ENG" \
     -e "TZ=${TZ:-Asia/Shanghai}" \
     ${MITM_EXTRA:-} \
@@ -581,16 +607,25 @@ docker_args(){
     [ -n "$cap" ] && capargs+=(--cap-add "$cap")
   done
   if [ "$NETWORK" = "host" ]; then
-    printf '%s\n' "${capargs[@]}"
+    # 必须显式传 --network host：不传就拿不到宿主网络（容器会落到默认 bridge），
+    # 后果：SYN 扫描/本地目标/宿主监听端口全都不可见 —— 实测踩过（127.0.0.1:3001 与 127.0.0.1:<mitm 端口> 都不可达）
+    printf '%s\n' --network host "${capargs[@]}"
   else
     printf '%s\n' --network pt-net "${capargs[@]}"
   fi
-  [ -n "${HTTP_PROXY:-}" ] && printf '%s\n' -e "HTTP_PROXY=$HTTP_PROXY" -e "HTTPS_PROXY=${HTTPS_PROXY:-$HTTP_PROXY}"
-  [ -n "${NO_PROXY:-}" ]   && printf '%s\n' -e "NO_PROXY=$NO_PROXY"
+  # 出口代理**只由用户显式要求**（默认关闭：沙箱直连目标）。
+  #   曾把宿主 shell 的 HTTP_PROXY/NO_PROXY 原样塞进容器（WSL 翻墙代理的特例），后果：
+  #   目标流量绕到宿主代理上、内网/本地目标直接失败、还盖掉流量存档的代理注入。
+  #   用法：PT_SANDBOX_PROXY=http://host:port pt（可选 PT_SANDBOX_NO_PROXY=...）
+  if [ -n "${PT_SANDBOX_PROXY:-}" ]; then
+    printf '%s\n' -e "HTTP_PROXY=$PT_SANDBOX_PROXY" -e "HTTPS_PROXY=$PT_SANDBOX_PROXY" \
+      -e "http_proxy=$PT_SANDBOX_PROXY" -e "https_proxy=$PT_SANDBOX_PROXY"
+    printf '%s\n' -e "NO_PROXY=${PT_SANDBOX_NO_PROXY:-localhost,127.0.0.1}" -e "no_proxy=${PT_SANDBOX_NO_PROXY:-localhost,127.0.0.1}"
+  fi
 }
 
 cmd_run(){
-  need_docker; sync_identity; prune_resources; ensure_fff_state; ensure_models_json; sync_settings_model; pick_engagement; ensure_network
+  need_docker; sync_identity; prune_resources; ensure_fff_state; ensure_models_json; sync_settings_model; pick_engagement; ensure_network; cleanup_stale_capture
   local cname; cname="$(container_name "$ENG")"
   # 默认把 config.env 里的模型/思考档传给 pi（否则 pi 用自带默认模型，与配置不符 —— 实测踩过）
   # 用户显式给了 --model / --thinking 则不覆盖
@@ -612,6 +647,26 @@ cmd_run(){
   fi
 }
 
+
+cmd_tools(){   # 全量工具清单（在镜像里跑自检脚本，85 项）—— 权威清单，不靠人工列举
+  need_docker; resolve_eng
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "镜像不存在：$IMAGE（先 pt update）"
+  log "全量工具自检（镜像 $IMAGE；在容器内跑 /opt/pt/tools/99-verify.sh）"
+  if [ -f /opt/pt/tools/99-verify.sh ]; then :; fi
+  docker run --rm --entrypoint bash "$IMAGE" -lc 'bash /opt/pt/tools/99-verify.sh 2>&1' > /tmp/pt-tools-$$.log 2>&1 || true
+  if grep -q "全部通过" /tmp/pt-tools-$$.log; then
+    ok "全部通过：$(grep -cE '✅' /tmp/pt-tools-$$.log) 项"
+  else
+    warn "有未通过项："
+    grep -E "❌" /tmp/pt-tools-$$.log | sed 's/^/    /'
+  fi
+  if [ "${1:-}" = "--list" ]; then
+    grep -E "✅" /tmp/pt-tools-$$.log | sed 's/.*✅ *//' | sed 's/^/  /'
+  else
+    echo "  （要列全部条目加 --list；日志：/tmp/pt-tools-$$.log）"
+  fi
+  rm -f /tmp/pt-tools-$$.log 2>/dev/null || true
+}
 
 cmd_ls(){   # 列出交战（带元数据；不启容器）
   mkdir -p "$WS_ROOT"
@@ -799,7 +854,7 @@ for n in notes[:6]:
 PYEOF
 }
 cmd_doctor(){
-  need_docker; sync_identity || true; prune_resources || true; ensure_fff_state || true; ensure_models_json || true; sync_settings_model || true; local bad=0
+  need_docker; sync_identity || true; prune_resources || true; ensure_fff_state || true; ensure_models_json || true; sync_settings_model || true; cleanup_stale_capture || true; local bad=0
   chk(){ local n="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$n"; else warn "$n 失败"; bad=$((bad+1)); fi; }
   chk "docker daemon" docker info
   chk "镜像 $IMAGE" docker image inspect "$IMAGE"
@@ -879,8 +934,14 @@ cmd_capture(){ need_docker; resolve_eng
         warn "本次尝试的端口范围：$base-$((base + 9))"
       fi ;;
     off)
-      if docker rm -f "$cname" >/dev/null 2>&1; then ok "已关闭"; else ok "本就没开启"; fi
-      rm -f "$portfile" "$WS/.mitm-ca.pem" "$WS/.mitm-ca-bundle.pem" 2>/dev/null || true
+      # 先优雅停止（SIGTERM → mitmdump 刷盘），再删除；直接 rm -f 会丢最后未刷盘的流量
+      if docker stop -t 5 "$cname" >/dev/null 2>&1; then
+        docker rm -f "$cname" >/dev/null 2>&1 || true
+        ok "已关闭（存档已刷盘）"
+      else
+        docker rm -f "$cname" >/dev/null 2>&1 && ok "已关闭" || ok "本就没开启"
+      fi
+      rm -f "$portfile" 2>/dev/null || true   # 只清状态；CA 文件保留（运行中的容器仍指向它们，删了 TLS 会全挂）
       echo "  提示：**已在运行的**交战容器仍带着代理环境变量，退出重进才会去掉。" ;;
     ""|status)
       if docker ps --format '{{.Names}}' | grep -qx "$cname"; then
@@ -978,6 +1039,7 @@ PYX
       *) die "用法：pt mcp [list|add]";;
     esac ;;
   ls|list) cmd_ls ;;
+  tools) shift; cmd_tools "$@" ;;
   rename) shift; cmd_rename "$@" ;;
   rm|archive) shift; cmd_rm "$@" ;;
   resume) shift; cmd_run --continue ;;
